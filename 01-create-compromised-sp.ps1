@@ -12,7 +12,6 @@ function Write-Log {
         [Parameter(Mandatory = $true)][string]$Message,
         [ValidateSet('INFO','WARN','ERROR')][string]$Level = 'INFO'
     )
-
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     Write-Output "[$timestamp] [$Level] $Message"
 }
@@ -33,7 +32,6 @@ function Invoke-WithRetry {
         }
         catch {
             Write-Log "$ActionName failed on attempt $attempt. $($_.Exception.Message)" 'WARN'
-
             if ($attempt -lt $MaxAttempts) {
                 Start-Sleep -Seconds $DelaySeconds
             }
@@ -48,6 +46,13 @@ function Invoke-WithRetry {
     throw "$ActionName failed after $MaxAttempts attempts."
 }
 
+function Get-CloudSliceWorkRoot {
+    $baseTemp = [System.IO.Path]::GetTempPath()
+    $root = Join-Path $baseTemp 'CloudSlice'
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    return $root
+}
+
 function Initialize-LabContext {
     param(
         [string]$SubscriptionId,
@@ -56,9 +61,8 @@ function Initialize-LabContext {
     )
 
     $context = Get-AzContext -ErrorAction SilentlyContinue
-
     if (-not $context) {
-        throw 'No Azure context found. Add Connect-AzAccount or use the Skillable authenticated LCA context before running this script.'
+        throw 'No Azure context found. The cloud-target LCA must run in an authenticated Az PowerShell context.'
     }
 
     if ([string]::IsNullOrWhiteSpace($SubscriptionId) -or $SubscriptionId -like '@lab.*') {
@@ -67,7 +71,6 @@ function Initialize-LabContext {
     }
 
     Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
-
     $context = Get-AzContext -ErrorAction Stop
 
     if ([string]::IsNullOrWhiteSpace($TenantId) -or $TenantId -like '@lab.*') {
@@ -77,7 +80,6 @@ function Initialize-LabContext {
 
     if ([string]::IsNullOrWhiteSpace($ResourceGroupName) -or $ResourceGroupName -like '@lab.*') {
         Write-Log 'ResourceGroupName was blank/tokenized. Attempting to discover the Cloud Slice resource group.'
-
         $candidateStorage = Get-AzStorageAccount -ErrorAction Stop |
             Where-Object { $_.StorageAccountName -like 'stcloudslice*' } |
             Select-Object -First 1
@@ -98,9 +100,7 @@ function Initialize-LabContext {
 }
 
 function Get-CloudSliceResources {
-    param(
-        [Parameter(Mandatory = $true)][string]$ResourceGroupName
-    )
+    param([Parameter(Mandatory = $true)][string]$ResourceGroupName)
 
     $storage = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -ErrorAction Stop |
         Where-Object { $_.StorageAccountName -like 'stcloudslice*' } |
@@ -114,43 +114,40 @@ function Get-CloudSliceResources {
         Where-Object { $_.Name -like 'nsg-cloudslice-web-*' } |
         Select-Object -First 1
 
-    $staticWebApp = Get-AzResource `
-        -ResourceGroupName $ResourceGroupName `
-        -ResourceType 'Microsoft.Web/staticSites' `
-        -ErrorAction SilentlyContinue |
+    $staticWebApp = Get-AzResource -ResourceGroupName $ResourceGroupName -ResourceType 'Microsoft.Web/staticSites' -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -like 'swa-cloudslice-*' } |
         Select-Object -First 1
 
-    if (-not $storage) {
-        throw "Cloud Slice storage account not found in resource group '$ResourceGroupName'."
-    }
-
-    if (-not $keyVault) {
-        throw "Cloud Slice Key Vault not found in resource group '$ResourceGroupName'."
-    }
-
-    if (-not $nsg) {
-        throw "Cloud Slice NSG not found in resource group '$ResourceGroupName'."
-    }
+    if (-not $storage) { throw "Cloud Slice storage account not found in resource group '$ResourceGroupName'." }
+    if (-not $keyVault) { throw "Cloud Slice Key Vault not found in resource group '$ResourceGroupName'." }
+    if (-not $nsg) { throw "Cloud Slice NSG not found in resource group '$ResourceGroupName'." }
 
     [pscustomobject]@{
         StorageAccountName = $storage.StorageAccountName
-        StorageAccountId = $storage.Id
-        KeyVaultName = $keyVault.VaultName
-        KeyVaultId = $keyVault.ResourceId
-        NsgName = $nsg.Name
-        NsgId = $nsg.Id
-        StaticWebAppName = if ($staticWebApp) { $staticWebApp.Name } else { $null }
+        StorageAccountId   = $storage.Id
+        KeyVaultName       = $keyVault.VaultName
+        KeyVaultId         = $keyVault.ResourceId
+        NsgName            = $nsg.Name
+        NsgId              = $nsg.Id
+        StaticWebAppName   = if ($staticWebApp) { $staticWebApp.Name } else { $null }
+    }
+}
+
+function ConvertFrom-SecureStringToPlainText {
+    param([Parameter(Mandatory = $true)][securestring]$SecureString)
+
+    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+    }
+    finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
     }
 }
 
 Write-Log 'Starting LCA 01: create compromised service principal.'
 
-$lab = Initialize-LabContext `
-    -SubscriptionId $SubscriptionId `
-    -ResourceGroupName $ResourceGroupName `
-    -TenantId $TenantId
-
+$lab = Initialize-LabContext -SubscriptionId $SubscriptionId -ResourceGroupName $ResourceGroupName -TenantId $TenantId
 $SubscriptionId = $lab.SubscriptionId
 $ResourceGroupName = $lab.ResourceGroupName
 $TenantId = $lab.TenantId
@@ -164,9 +161,7 @@ Write-Log "Storage account: $($resources.StorageAccountName)"
 Write-Log "Key Vault: $($resources.KeyVaultName)"
 Write-Log "NSG: $($resources.NsgName)"
 
-$app = Get-AzADApplication -DisplayName $AppDisplayName -ErrorAction SilentlyContinue |
-    Select-Object -First 1
-
+$app = Get-AzADApplication -DisplayName $AppDisplayName -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $app) {
     Write-Log "Creating app registration: $AppDisplayName"
     $app = New-AzADApplication -DisplayName $AppDisplayName -ErrorAction Stop
@@ -177,9 +172,7 @@ else {
 
 $appId = $app.AppId
 
-$sp = Get-AzADServicePrincipal -ApplicationId $appId -ErrorAction SilentlyContinue |
-    Select-Object -First 1
-
+$sp = Get-AzADServicePrincipal -ApplicationId $appId -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $sp) {
     Write-Log "Creating service principal for appId: $appId"
     $sp = New-AzADServicePrincipal -ApplicationId $appId -ErrorAction Stop
@@ -189,7 +182,6 @@ else {
 }
 
 Write-Log 'Creating client secret.'
-
 $credential = New-AzADAppCredential `
     -ApplicationId $appId `
     -StartDate (Get-Date) `
@@ -197,49 +189,37 @@ $credential = New-AzADAppCredential `
     -ErrorAction Stop
 
 $clientSecret = $credential.SecretText
-
 if ([string]::IsNullOrWhiteSpace($clientSecret)) {
     throw 'New-AzADAppCredential did not return SecretText.'
 }
 
 $currentAccount = (Get-AzContext).Account.Id
-
 if (-not [string]::IsNullOrWhiteSpace($currentAccount)) {
     Write-Log "Ensuring current setup account has Key Vault Secrets Officer on $($resources.KeyVaultName)."
-
-    Invoke-WithRetry `
-        -ActionName 'Assign Key Vault Secrets Officer to current setup account' `
-        -ScriptBlock {
-            New-AzRoleAssignment `
-                -SignInName $currentAccount `
-                -RoleDefinitionName 'Key Vault Secrets Officer' `
-                -Scope $resources.KeyVaultId `
-                -ErrorAction Stop | Out-Null
-        } `
-        -AllowFailure
+    Invoke-WithRetry -ActionName 'Assign Key Vault Secrets Officer to current setup account' -ScriptBlock {
+        New-AzRoleAssignment `
+            -SignInName $currentAccount `
+            -RoleDefinitionName 'Key Vault Secrets Officer' `
+            -Scope $resources.KeyVaultId `
+            -ErrorAction Stop | Out-Null
+    } -AllowFailure
 }
 
 Write-Log 'Storing client secret in Key Vault.'
-
 $secureSecret = ConvertTo-SecureString -String $clientSecret -AsPlainText -Force
-
-Invoke-WithRetry `
-    -ActionName 'Store svc-cloudslice-deploy secret in Key Vault' `
-    -MaxAttempts 10 `
-    -DelaySeconds 20 `
-    -ScriptBlock {
-        Set-AzKeyVaultSecret `
-            -VaultName $resources.KeyVaultName `
-            -Name 'svc-cloudslice-deploy-client-secret' `
-            -SecretValue $secureSecret `
-            -ContentType 'client-secret' `
-            -Tag @{
-                owner = 'Cloud Slice DevOps'
-                rotation = 'overdue'
-                labPurpose = 'investigation-evidence'
-            } `
-            -ErrorAction Stop | Out-Null
-    }
+Invoke-WithRetry -ActionName 'Store svc-cloudslice-deploy secret in Key Vault' -MaxAttempts 10 -DelaySeconds 20 -ScriptBlock {
+    Set-AzKeyVaultSecret `
+        -VaultName $resources.KeyVaultName `
+        -Name 'svc-cloudslice-deploy-client-secret' `
+        -SecretValue $secureSecret `
+        -ContentType 'client-secret' `
+        -Tag @{
+            owner = 'Cloud Slice DevOps'
+            rotation = 'overdue'
+            labPurpose = 'investigation-evidence'
+        } `
+        -ErrorAction Stop | Out-Null
+}
 
 $secret = Get-AzKeyVaultSecret `
     -VaultName $resources.KeyVaultName `
@@ -249,50 +229,36 @@ $secret = Get-AzKeyVaultSecret `
 $secretUri = $secret.Id
 
 Write-Log 'Assigning intentionally excessive Contributor access at resource group scope.'
-
-Invoke-WithRetry `
-    -ActionName 'Assign Contributor to svc-cloudslice-deploy' `
-    -ScriptBlock {
-        New-AzRoleAssignment `
-            -ObjectId $sp.Id `
-            -RoleDefinitionName 'Contributor' `
-            -Scope $resourceGroupId `
-            -ErrorAction Stop | Out-Null
-    } `
-    -AllowFailure
+Invoke-WithRetry -ActionName 'Assign Contributor to svc-cloudslice-deploy' -ScriptBlock {
+    New-AzRoleAssignment `
+        -ObjectId $sp.Id `
+        -RoleDefinitionName 'Contributor' `
+        -Scope $resourceGroupId `
+        -ErrorAction Stop | Out-Null
+} -AllowFailure
 
 Write-Log 'Assigning Storage Blob Data Reader on the lab storage account.'
-
-Invoke-WithRetry `
-    -ActionName 'Assign Storage Blob Data Reader to svc-cloudslice-deploy' `
-    -ScriptBlock {
-        New-AzRoleAssignment `
-            -ObjectId $sp.Id `
-            -RoleDefinitionName 'Storage Blob Data Reader' `
-            -Scope $resources.StorageAccountId `
-            -ErrorAction Stop | Out-Null
-    } `
-    -AllowFailure
+Invoke-WithRetry -ActionName 'Assign Storage Blob Data Reader to svc-cloudslice-deploy' -ScriptBlock {
+    New-AzRoleAssignment `
+        -ObjectId $sp.Id `
+        -RoleDefinitionName 'Storage Blob Data Reader' `
+        -Scope $resources.StorageAccountId `
+        -ErrorAction Stop | Out-Null
+} -AllowFailure
 
 Write-Log 'Assigning Key Vault Secrets User on Key Vault.'
+Invoke-WithRetry -ActionName 'Assign Key Vault Secrets User to svc-cloudslice-deploy' -ScriptBlock {
+    New-AzRoleAssignment `
+        -ObjectId $sp.Id `
+        -RoleDefinitionName 'Key Vault Secrets User' `
+        -Scope $resources.KeyVaultId `
+        -ErrorAction Stop | Out-Null
+} -AllowFailure
 
-Invoke-WithRetry `
-    -ActionName 'Assign Key Vault Secrets User to svc-cloudslice-deploy' `
-    -ScriptBlock {
-        New-AzRoleAssignment `
-            -ObjectId $sp.Id `
-            -RoleDefinitionName 'Key Vault Secrets User' `
-            -Scope $resources.KeyVaultId `
-            -ErrorAction Stop | Out-Null
-    } `
-    -AllowFailure
+Write-Log 'Writing context artifact to the investigation-artifacts container for cloud-target continuity.'
 
-$outputPath = 'C:\CloudSlice'
-
-if (-not (Test-Path $outputPath)) {
-    New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
-}
-
+$workRoot = Get-CloudSliceWorkRoot
+$contextPath = Join-Path $workRoot 'svc-cloudslice-deploy.json'
 [ordered]@{
     TenantId = $TenantId
     SubscriptionId = $SubscriptionId
@@ -300,7 +266,6 @@ if (-not (Test-Path $outputPath)) {
     AppDisplayName = $AppDisplayName
     ClientId = $appId
     ServicePrincipalObjectId = $sp.Id
-    ClientSecret = $clientSecret
     KeyVaultName = $resources.KeyVaultName
     KeyVaultId = $resources.KeyVaultId
     SecretName = 'svc-cloudslice-deploy-client-secret'
@@ -309,6 +274,15 @@ if (-not (Test-Path $outputPath)) {
     StorageAccountId = $resources.StorageAccountId
     NsgName = $resources.NsgName
     StaticWebAppName = $resources.StaticWebAppName
-} | ConvertTo-Json -Depth 6 | Set-Content -Path "$outputPath\svc-cloudslice-deploy.json" -Encoding UTF8
+} | ConvertTo-Json -Depth 6 | Set-Content -Path $contextPath -Encoding UTF8
 
-Write-Log "LCA 01 complete. Context saved to $outputPath\svc-cloudslice-deploy.json"
+$storageAccount = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $resources.StorageAccountName -ErrorAction Stop
+Set-AzStorageBlobContent `
+    -Context $storageAccount.Context `
+    -Container 'investigation-artifacts' `
+    -File $contextPath `
+    -Blob 'setup/svc-cloudslice-deploy.json' `
+    -Force `
+    -ErrorAction Stop | Out-Null
+
+Write-Log 'LCA 01 complete.'
