@@ -1,4 +1,8 @@
-#requires -Modules Az.Accounts,Az.Resources,Az.Storage,Az.KeyVault,Az.Network
+param(
+    [string]$SubscriptionId = '@lab.CloudSubscription.Id',
+    [string]$ResourceGroupName = '@lab.CloudResourceGroup(RG1).Name',
+    [string]$TenantId = '@lab.CloudTenant.Id'
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -7,39 +11,8 @@ function Write-Log {
         [Parameter(Mandatory = $true)][string]$Message,
         [ValidateSet('INFO','WARN','ERROR')][string]$Level = 'INFO'
     )
-
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     Write-Output "[$timestamp] [$Level] $Message"
-}
-
-function Invoke-WithRetry {
-    param(
-        [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock,
-        [int]$MaxAttempts = 8,
-        [int]$DelaySeconds = 15,
-        [switch]$AllowFailure,
-        [string]$ActionName = 'operation'
-    )
-
-    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-        try {
-            Write-Log "Running $ActionName. Attempt $attempt of $MaxAttempts."
-            return & $ScriptBlock
-        }
-        catch {
-            Write-Log "$ActionName failed on attempt $attempt. $($_.Exception.Message)" 'WARN'
-            if ($attempt -lt $MaxAttempts) {
-                Start-Sleep -Seconds $DelaySeconds
-            }
-        }
-    }
-
-    if ($AllowFailure) {
-        Write-Log "$ActionName failed after $MaxAttempts attempts. Continuing." 'WARN'
-        return $null
-    }
-
-    throw "$ActionName failed after $MaxAttempts attempts."
 }
 
 function Initialize-LabContext {
@@ -122,13 +95,7 @@ function Get-CloudSliceResources {
     }
 }
 
-param(
-    [string]$SubscriptionId = '@lab.CloudSubscription.Id',
-    [string]$ResourceGroupName = '@lab.CloudResourceGroup(RG1).Name',
-    [string]$TenantId = '@lab.CloudTenant.Id'
-)
-
-Write-Log 'Starting LCA 02: seed artifacts.'
+Write-Log 'Starting LCA 02: seed Cloud Slice artifacts.'
 
 $lab = Initialize-LabContext -SubscriptionId $SubscriptionId -ResourceGroupName $ResourceGroupName -TenantId $TenantId
 $SubscriptionId = $lab.SubscriptionId
@@ -142,7 +109,12 @@ if (-not (Test-Path $contextPath)) {
 
 $ctx = Get-Content $contextPath -Raw | ConvertFrom-Json
 $resources = Get-CloudSliceResources -ResourceGroupName $ResourceGroupName
-$storageAccount = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $resources.StorageAccountName -ErrorAction Stop
+
+$storageAccount = Get-AzStorageAccount `
+    -ResourceGroupName $ResourceGroupName `
+    -Name $resources.StorageAccountName `
+    -ErrorAction Stop
+
 $storageContext = $storageAccount.Context
 
 $seedRoot = 'C:\CloudSlice\seed'
@@ -236,15 +208,56 @@ TicketId,Region,Status,Priority,AssignedTeam
 </html>
 '@ | Set-Content -Path "$seedRoot\site\index.html" -Encoding UTF8
 
-Set-AzStorageBlobContent -Context $storageContext -Container 'investigation-artifacts' -File "$seedRoot\researcher-report.txt" -Blob 'researcher-report.txt' -Force -ErrorAction Stop | Out-Null
-Set-AzStorageBlobContent -Context $storageContext -Container 'investigation-artifacts' -File "$seedRoot\repo\appsettings.production.json" -Blob 'leaked-repo/appsettings.production.json' -Force -ErrorAction Stop | Out-Null
-Set-AzStorageBlobContent -Context $storageContext -Container 'business-files' -File "$seedRoot\business\deployment-notes.txt" -Blob 'operations/deployment-notes.txt' -Force -ErrorAction Stop | Out-Null
-Set-AzStorageBlobContent -Context $storageContext -Container 'business-files' -File "$seedRoot\business\customer-queue.csv" -Blob 'exports/customer-queue.csv' -Force -ErrorAction Stop | Out-Null
-Set-AzStorageBlobContent -Context $storageContext -Container 'web-content' -File "$seedRoot\site\index.html" -Blob 'index.html' -Force -ErrorAction Stop | Out-Null
+Write-Log 'Uploading investigation and business artifacts to blob storage.'
+
+Set-AzStorageBlobContent `
+    -Context $storageContext `
+    -Container 'investigation-artifacts' `
+    -File "$seedRoot\researcher-report.txt" `
+    -Blob 'researcher-report.txt' `
+    -Force `
+    -ErrorAction Stop | Out-Null
+
+Set-AzStorageBlobContent `
+    -Context $storageContext `
+    -Container 'investigation-artifacts' `
+    -File "$seedRoot\repo\appsettings.production.json" `
+    -Blob 'leaked-repo/appsettings.production.json' `
+    -Force `
+    -ErrorAction Stop | Out-Null
+
+Set-AzStorageBlobContent `
+    -Context $storageContext `
+    -Container 'business-files' `
+    -File "$seedRoot\business\deployment-notes.txt" `
+    -Blob 'operations/deployment-notes.txt' `
+    -Force `
+    -ErrorAction Stop | Out-Null
+
+Set-AzStorageBlobContent `
+    -Context $storageContext `
+    -Container 'business-files' `
+    -File "$seedRoot\business\customer-queue.csv" `
+    -Blob 'exports/customer-queue.csv' `
+    -Force `
+    -ErrorAction Stop | Out-Null
+
+Set-AzStorageBlobContent `
+    -Context $storageContext `
+    -Container 'web-content' `
+    -File "$seedRoot\site\index.html" `
+    -Blob 'index.html' `
+    -Force `
+    -ErrorAction Stop | Out-Null
 
 $desktop = [Environment]::GetFolderPath('Desktop')
 if (-not [string]::IsNullOrWhiteSpace($desktop) -and (Test-Path $desktop)) {
     Copy-Item "$seedRoot\researcher-report.txt" "$desktop\Cloud Slice - Researcher Report.txt" -Force
+    Write-Log "Copied starting clue to $desktop\Cloud Slice - Researcher Report.txt"
+}
+else {
+    Write-Log 'Desktop path not found. Skipping local clue copy.' 'WARN'
 }
 
+Write-Log "Static Web App resource: $($resources.StaticWebAppName)"
 Write-Log 'LCA 02 complete.'
