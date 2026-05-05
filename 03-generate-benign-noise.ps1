@@ -1,4 +1,8 @@
-#requires -Modules Az.Accounts,Az.Resources,Az.Storage,Az.KeyVault,Az.Network
+param(
+    [string]$SubscriptionId = '@lab.CloudSubscription.Id',
+    [string]$ResourceGroupName = '@lab.CloudResourceGroup(RG1).Name',
+    [string]$TenantId = '@lab.CloudTenant.Id'
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -7,39 +11,8 @@ function Write-Log {
         [Parameter(Mandatory = $true)][string]$Message,
         [ValidateSet('INFO','WARN','ERROR')][string]$Level = 'INFO'
     )
-
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     Write-Output "[$timestamp] [$Level] $Message"
-}
-
-function Invoke-WithRetry {
-    param(
-        [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock,
-        [int]$MaxAttempts = 8,
-        [int]$DelaySeconds = 15,
-        [switch]$AllowFailure,
-        [string]$ActionName = 'operation'
-    )
-
-    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-        try {
-            Write-Log "Running $ActionName. Attempt $attempt of $MaxAttempts."
-            return & $ScriptBlock
-        }
-        catch {
-            Write-Log "$ActionName failed on attempt $attempt. $($_.Exception.Message)" 'WARN'
-            if ($attempt -lt $MaxAttempts) {
-                Start-Sleep -Seconds $DelaySeconds
-            }
-        }
-    }
-
-    if ($AllowFailure) {
-        Write-Log "$ActionName failed after $MaxAttempts attempts. Continuing." 'WARN'
-        return $null
-    }
-
-    throw "$ActionName failed after $MaxAttempts attempts."
 }
 
 function Initialize-LabContext {
@@ -122,21 +95,30 @@ function Get-CloudSliceResources {
     }
 }
 
-param(
-    [string]$SubscriptionId = '@lab.CloudSubscription.Id',
-    [string]$ResourceGroupName = '@lab.CloudResourceGroup(RG1).Name',
-    [string]$TenantId = '@lab.CloudTenant.Id'
-)
-
 Write-Log 'Starting LCA 03: generate benign helpDeskSupport noise.'
 
 $lab = Initialize-LabContext -SubscriptionId $SubscriptionId -ResourceGroupName $ResourceGroupName -TenantId $TenantId
 $SubscriptionId = $lab.SubscriptionId
 $ResourceGroupName = $lab.ResourceGroupName
+$TenantId = $lab.TenantId
 
 $resources = Get-CloudSliceResources -ResourceGroupName $ResourceGroupName
-$storageAccount = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $resources.StorageAccountName -ErrorAction Stop
 
+Write-Log "Resource group: $ResourceGroupName"
+Write-Log "Storage account: $($resources.StorageAccountName)"
+Write-Log "Key Vault: $($resources.KeyVaultName)"
+Write-Log "NSG: $($resources.NsgName)"
+if ($resources.StaticWebAppName) {
+    Write-Log "Static Web App: $($resources.StaticWebAppName)"
+}
+
+$storageAccount = Get-AzStorageAccount `
+    -ResourceGroupName $ResourceGroupName `
+    -Name $resources.StorageAccountName `
+    -ErrorAction Stop
+
+# Normal read/list activity.
+Write-Log 'Generating benign resource read activity.'
 Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop | Out-Null
 Get-AzResource -ResourceGroupName $ResourceGroupName -ErrorAction Stop | Out-Null
 Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $resources.StorageAccountName -ErrorAction Stop | Out-Null
@@ -145,11 +127,19 @@ Get-AzKeyVault -ResourceGroupName $ResourceGroupName -VaultName $resources.KeyVa
 Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroupName -Name $resources.NsgName -ErrorAction Stop | Out-Null
 
 if ($resources.StaticWebAppName) {
-    Get-AzResource -ResourceGroupName $ResourceGroupName -ResourceType 'Microsoft.Web/staticSites' -Name $resources.StaticWebAppName -ErrorAction SilentlyContinue | Out-Null
+    Get-AzResource `
+        -ResourceGroupName $ResourceGroupName `
+        -ResourceType 'Microsoft.Web/staticSites' `
+        -Name $resources.StaticWebAppName `
+        -ErrorAction SilentlyContinue | Out-Null
 }
+
+# Harmless control-plane change to create support-user noise.
+Write-Log 'Applying harmless helpDeskSupport review tags to the resource group.'
 
 $rg = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop
 $tags = @{}
+
 if ($rg.Tags) {
     foreach ($key in $rg.Tags.Keys) {
         $tags[$key] = $rg.Tags[$key]
@@ -160,6 +150,9 @@ $tags['LastReviewedBy'] = 'helpDeskSupport'
 $tags['LastReviewedScenario'] = 'CloudSlice'
 $tags['LastReviewedDate'] = (Get-Date -Format 'yyyy-MM-dd')
 
-Set-AzResourceGroup -Name $ResourceGroupName -Tag $tags -ErrorAction Stop | Out-Null
+Set-AzResourceGroup `
+    -Name $ResourceGroupName `
+    -Tag $tags `
+    -ErrorAction Stop | Out-Null
 
 Write-Log 'LCA 03 complete.'
