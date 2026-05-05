@@ -15,6 +15,36 @@ function Write-Log {
     Write-Output "[$timestamp] [$Level] $Message"
 }
 
+function Invoke-WithRetry {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock,
+        [int]$MaxAttempts = 8,
+        [int]$DelaySeconds = 15,
+        [switch]$AllowFailure,
+        [string]$ActionName = 'operation'
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            Write-Log "Running $ActionName. Attempt $attempt of $MaxAttempts."
+            return & $ScriptBlock
+        }
+        catch {
+            Write-Log "$ActionName failed on attempt $attempt. $($_.Exception.Message)" 'WARN'
+            if ($attempt -lt $MaxAttempts) {
+                Start-Sleep -Seconds $DelaySeconds
+            }
+        }
+    }
+
+    if ($AllowFailure) {
+        Write-Log "$ActionName failed after $MaxAttempts attempts. Continuing." 'WARN'
+        return $null
+    }
+
+    throw "$ActionName failed after $MaxAttempts attempts."
+}
+
 function Initialize-LabContext {
     param(
         [string]$SubscriptionId,
@@ -210,45 +240,11 @@ TicketId,Region,Status,Priority,AssignedTeam
 
 Write-Log 'Uploading investigation and business artifacts to blob storage.'
 
-Set-AzStorageBlobContent `
-    -Context $storageContext `
-    -Container 'investigation-artifacts' `
-    -File "$seedRoot\researcher-report.txt" `
-    -Blob 'researcher-report.txt' `
-    -Force `
-    -ErrorAction Stop | Out-Null
-
-Set-AzStorageBlobContent `
-    -Context $storageContext `
-    -Container 'investigation-artifacts' `
-    -File "$seedRoot\repo\appsettings.production.json" `
-    -Blob 'leaked-repo/appsettings.production.json' `
-    -Force `
-    -ErrorAction Stop | Out-Null
-
-Set-AzStorageBlobContent `
-    -Context $storageContext `
-    -Container 'business-files' `
-    -File "$seedRoot\business\deployment-notes.txt" `
-    -Blob 'operations/deployment-notes.txt' `
-    -Force `
-    -ErrorAction Stop | Out-Null
-
-Set-AzStorageBlobContent `
-    -Context $storageContext `
-    -Container 'business-files' `
-    -File "$seedRoot\business\customer-queue.csv" `
-    -Blob 'exports/customer-queue.csv' `
-    -Force `
-    -ErrorAction Stop | Out-Null
-
-Set-AzStorageBlobContent `
-    -Context $storageContext `
-    -Container 'web-content' `
-    -File "$seedRoot\site\index.html" `
-    -Blob 'index.html' `
-    -Force `
-    -ErrorAction Stop | Out-Null
+Set-AzStorageBlobContent -Context $storageContext -Container 'investigation-artifacts' -File "$seedRoot\researcher-report.txt" -Blob 'researcher-report.txt' -Force -ErrorAction Stop | Out-Null
+Set-AzStorageBlobContent -Context $storageContext -Container 'investigation-artifacts' -File "$seedRoot\repo\appsettings.production.json" -Blob 'leaked-repo/appsettings.production.json' -Force -ErrorAction Stop | Out-Null
+Set-AzStorageBlobContent -Context $storageContext -Container 'business-files' -File "$seedRoot\business\deployment-notes.txt" -Blob 'operations/deployment-notes.txt' -Force -ErrorAction Stop | Out-Null
+Set-AzStorageBlobContent -Context $storageContext -Container 'business-files' -File "$seedRoot\business\customer-queue.csv" -Blob 'exports/customer-queue.csv' -Force -ErrorAction Stop | Out-Null
+Set-AzStorageBlobContent -Context $storageContext -Container 'web-content' -File "$seedRoot\site\index.html" -Blob 'index.html' -Force -ErrorAction Stop | Out-Null
 
 $desktop = [Environment]::GetFolderPath('Desktop')
 if (-not [string]::IsNullOrWhiteSpace($desktop) -and (Test-Path $desktop)) {
