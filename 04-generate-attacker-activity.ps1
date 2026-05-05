@@ -1,4 +1,9 @@
-#requires -Modules Az.Accounts,Az.Resources,Az.Storage,Az.KeyVault,Az.Network
+param(
+    [string]$SubscriptionId = '@lab.CloudSubscription.Id',
+    [string]$ResourceGroupName = '@lab.CloudResourceGroup(RG1).Name',
+    [string]$TenantId = '@lab.CloudTenant.Id',
+    [string]$AttackerSourceIpCidr = '198.51.100.23/32'
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -7,7 +12,6 @@ function Write-Log {
         [Parameter(Mandatory = $true)][string]$Message,
         [ValidateSet('INFO','WARN','ERROR')][string]$Level = 'INFO'
     )
-
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     Write-Output "[$timestamp] [$Level] $Message"
 }
@@ -122,13 +126,6 @@ function Get-CloudSliceResources {
     }
 }
 
-param(
-    [string]$SubscriptionId = '@lab.CloudSubscription.Id',
-    [string]$ResourceGroupName = '@lab.CloudResourceGroup(RG1).Name',
-    [string]$TenantId = '@lab.CloudTenant.Id',
-    [string]$AttackerSourceIpCidr = '198.51.100.23/32'
-)
-
 Write-Log 'Starting LCA 04: generate attacker activity as svc-cloudslice-deploy.'
 
 $lab = Initialize-LabContext -SubscriptionId $SubscriptionId -ResourceGroupName $ResourceGroupName -TenantId $TenantId
@@ -142,45 +139,104 @@ if (-not (Test-Path $contextPath)) {
 }
 
 $ctx = Get-Content $contextPath -Raw | ConvertFrom-Json
+
+if ([string]::IsNullOrWhiteSpace($ctx.ClientId)) {
+    throw 'ClientId is missing from C:\CloudSlice\svc-cloudslice-deploy.json.'
+}
+
+if ([string]::IsNullOrWhiteSpace($ctx.ClientSecret)) {
+    throw 'ClientSecret is missing from C:\CloudSlice\svc-cloudslice-deploy.json.'
+}
+
 $secureClientSecret = ConvertTo-SecureString -String $ctx.ClientSecret -AsPlainText -Force
 $credential = New-Object System.Management.Automation.PSCredential($ctx.ClientId, $secureClientSecret)
 
+Write-Log 'Signing in as svc-cloudslice-deploy service principal.'
 Disconnect-AzAccount -ErrorAction SilentlyContinue | Out-Null
-Connect-AzAccount -ServicePrincipal -Tenant $TenantId -Credential $credential -ErrorAction Stop | Out-Null
+Connect-AzAccount `
+    -ServicePrincipal `
+    -Tenant $TenantId `
+    -Credential $credential `
+    -ErrorAction Stop | Out-Null
+
 Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
 
 $resources = Get-CloudSliceResources -ResourceGroupName $ResourceGroupName
-$storageContext = New-AzStorageContext -StorageAccountName $resources.StorageAccountName -UseConnectedAccount -ErrorAction Stop
 
-Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop | Out-Null
-Get-AzResource -ResourceGroupName $ResourceGroupName -ErrorAction Stop | Out-Null
-Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $resources.StorageAccountName -ErrorAction Stop | Out-Null
-Get-AzStorageContainer -Context $storageContext -ErrorAction Stop | Out-Null
-Get-AzStorageBlob -Context $storageContext -Container 'business-files' -ErrorAction Stop | Out-Null
+Write-Log "Resource group: $ResourceGroupName"
+Write-Log "Storage account: $($resources.StorageAccountName)"
+Write-Log "Key Vault: $($resources.KeyVaultName)"
+Write-Log "NSG: $($resources.NsgName)"
+
+# Use Microsoft Entra auth for blob access so Storage Blob Data Reader is exercised.
+$storageContext = New-AzStorageContext `
+    -StorageAccountName $resources.StorageAccountName `
+    -UseConnectedAccount `
+    -ErrorAction Stop
+
+Write-Log 'Generating attacker resource enumeration activity.'
+
+Invoke-WithRetry -ActionName 'Enumerate resource group' -ScriptBlock {
+    Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop | Out-Null
+}
+
+Invoke-WithRetry -ActionName 'List resources in resource group' -ScriptBlock {
+    Get-AzResource -ResourceGroupName $ResourceGroupName -ErrorAction Stop | Out-Null
+}
+
+Invoke-WithRetry -ActionName 'Show storage account' -ScriptBlock {
+    Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $resources.StorageAccountName -ErrorAction Stop | Out-Null
+}
+
+Invoke-WithRetry -ActionName 'List storage containers' -MaxAttempts 10 -DelaySeconds 20 -ScriptBlock {
+    Get-AzStorageContainer -Context $storageContext -ErrorAction Stop | Out-Null
+}
+
+Write-Log 'Generating attacker storage access evidence.'
+
+Invoke-WithRetry -ActionName 'List blobs in business-files' -MaxAttempts 10 -DelaySeconds 20 -ScriptBlock {
+    Get-AzStorageBlob `
+        -Context $storageContext `
+        -Container 'business-files' `
+        -ErrorAction Stop | Out-Null
+}
 
 $downloadPath = 'C:\CloudSlice\attacker-downloads'
 New-Item -ItemType Directory -Path $downloadPath -Force | Out-Null
-Get-AzStorageBlobContent `
-    -Context $storageContext `
-    -Container 'business-files' `
-    -Blob 'operations/deployment-notes.txt' `
-    -Destination "$downloadPath\deployment-notes.txt" `
-    -Force `
-    -ErrorAction Stop | Out-Null
 
+Invoke-WithRetry -ActionName 'Download deployment-notes.txt from business-files' -MaxAttempts 10 -DelaySeconds 20 -ScriptBlock {
+    Get-AzStorageBlobContent `
+        -Context $storageContext `
+        -Container 'business-files' `
+        -Blob 'operations/deployment-notes.txt' `
+        -Destination "$downloadPath\deployment-notes.txt" `
+        -Force `
+        -ErrorAction Stop | Out-Null
+}
+
+Write-Log 'Attempting Key Vault secret read as compromised identity.'
 try {
-    Get-AzKeyVaultSecret -VaultName $resources.KeyVaultName -Name 'svc-cloudslice-deploy-client-secret' -ErrorAction Stop | Out-Null
+    Get-AzKeyVaultSecret `
+        -VaultName $resources.KeyVaultName `
+        -Name 'svc-cloudslice-deploy-client-secret' `
+        -ErrorAction Stop | Out-Null
+
+    Write-Log 'Key Vault secret read succeeded.'
 }
 catch {
-    Write-Log 'Key Vault secret read failed. Continuing because this may be intentional.' 'WARN'
+    Write-Log "Key Vault secret read failed. Continuing. $($_.Exception.Message)" 'WARN'
 }
 
-$nsg = Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroupName -Name $resources.NsgName -ErrorAction Stop
+Write-Log 'Creating suspicious NSG rule.'
+
+$nsg = Get-AzNetworkSecurityGroup `
+    -ResourceGroupName $ResourceGroupName `
+    -Name $resources.NsgName `
+    -ErrorAction Stop
+
 $existingRule = $nsg.SecurityRules | Where-Object { $_.Name -eq 'Allow-Temporary-RemoteAccess' }
 
 if (-not $existingRule) {
-    Write-Log 'Creating suspicious NSG rule: Allow-Temporary-RemoteAccess.'
-
     $nsg | Add-AzNetworkSecurityRuleConfig `
         -Name 'Allow-Temporary-RemoteAccess' `
         -Description 'Temporary remote access rule created by deployment automation.' `
@@ -194,13 +250,17 @@ if (-not $existingRule) {
         -DestinationPortRange 3389 | Out-Null
 
     $nsg | Set-AzNetworkSecurityGroup -ErrorAction Stop | Out-Null
+    Write-Log 'Created NSG rule: Allow-Temporary-RemoteAccess.'
 }
 else {
     Write-Log 'Suspicious NSG rule already exists. Skipping creation.' 'WARN'
 }
 
+Write-Log 'Adding suspicious resource group tags.'
+
 $rg = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop
 $tags = @{}
+
 if ($rg.Tags) {
     foreach ($key in $rg.Tags.Keys) {
         $tags[$key] = $rg.Tags[$key]
@@ -210,7 +270,10 @@ if ($rg.Tags) {
 $tags['RemoteAccessException'] = 'Temporary'
 $tags['ExceptionOwner'] = 'svc-cloudslice-deploy'
 
-Set-AzResourceGroup -Name $ResourceGroupName -Tag $tags -ErrorAction Stop | Out-Null
+Set-AzResourceGroup `
+    -Name $ResourceGroupName `
+    -Tag $tags `
+    -ErrorAction Stop | Out-Null
 
 Disconnect-AzAccount -ErrorAction SilentlyContinue | Out-Null
 
