@@ -168,7 +168,6 @@ Write-Log "Storage account: $($resources.StorageAccountName)"
 Write-Log "Key Vault: $($resources.KeyVaultName)"
 Write-Log "NSG: $($resources.NsgName)"
 
-# Use Microsoft Entra auth for blob access so Storage Blob Data Reader is exercised.
 $storageContext = New-AzStorageContext `
     -StorageAccountName $resources.StorageAccountName `
     -UseConnectedAccount `
