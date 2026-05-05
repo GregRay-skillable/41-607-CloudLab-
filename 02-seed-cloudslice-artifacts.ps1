@@ -1,259 +1,319 @@
+#requires -Version 5.1
+<#
+Cloud Slice lab script.
+Designed for Skillable Cloud Platform LCA or any PowerShell host with Az modules.
+#>
+
+[CmdletBinding()]
 param(
-    [string]$SubscriptionId = '@lab.CloudSubscription.Id',
-    [string]$ResourceGroupName = '@lab.CloudResourceGroup(RG1).Name',
-    [string]$TenantId = '@lab.CloudTenant.Id'
+    [string] $SubscriptionId = "",
+    [string] $TenantId = "",
+    [string] $ResourceGroupName = "",
+    [string] $SetupClientId = "",
+    [string] $SetupClientSecret = "",
+    [switch] $UseManagedIdentity,
+    [switch] $AllowModuleInstall
 )
 
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 
-function Write-Log {
-    param(
-        [Parameter(Mandatory = $true)][string]$Message,
-        [ValidateSet('INFO','WARN','ERROR')][string]$Level = 'INFO'
-    )
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    Write-Output "[$timestamp] [$Level] $Message"
+function Write-Section {
+    param([string] $Message)
+    Write-Host ""
+    Write-Host "==== $Message ===="
 }
 
-function Invoke-WithRetry {
+function Ensure-AzModule {
+    param([string[]] $ModuleNames)
+
+    foreach ($moduleName in $ModuleNames) {
+        if (-not (Get-Module -ListAvailable -Name $moduleName)) {
+            if (-not $AllowModuleInstall) {
+                throw "Required module '$moduleName' was not found. Re-run with -AllowModuleInstall or preinstall Az modules in the LCA host."
+            }
+
+            Write-Host "Installing module $moduleName..."
+            Install-Module -Name $moduleName -Scope CurrentUser -Force -AllowClobber -Repository PSGallery
+        }
+
+        Import-Module $moduleName -Force
+    }
+}
+
+function Connect-CloudSliceAz {
     param(
-        [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock,
-        [int]$MaxAttempts = 8,
-        [int]$DelaySeconds = 15,
-        [switch]$AllowFailure,
-        [string]$ActionName = 'operation'
+        [string] $SubscriptionId,
+        [string] $TenantId,
+        [string] $ClientId,
+        [string] $ClientSecret,
+        [switch] $UseManagedIdentity
     )
 
-    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-        try {
-            Write-Log "Running $ActionName. Attempt $attempt of $MaxAttempts."
-            return & $ScriptBlock
+    Write-Section "Authenticating to Azure"
+
+    $existing = Get-AzContext -ErrorAction SilentlyContinue
+    if ($existing -and [string]::IsNullOrWhiteSpace($ClientId) -and -not $UseManagedIdentity) {
+        Write-Host "Using existing Az context: $($existing.Account.Id)"
+    }
+    elseif ($UseManagedIdentity) {
+        Write-Host "Connecting with managed identity..."
+        if ([string]::IsNullOrWhiteSpace($TenantId)) {
+            Connect-AzAccount -Identity | Out-Null
         }
-        catch {
-            Write-Log "$ActionName failed on attempt $attempt. $($_.Exception.Message)" 'WARN'
-            if ($attempt -lt $MaxAttempts) {
-                Start-Sleep -Seconds $DelaySeconds
+        else {
+            Connect-AzAccount -Identity -Tenant $TenantId | Out-Null
+        }
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($ClientId) -and -not [string]::IsNullOrWhiteSpace($ClientSecret) -and -not [string]::IsNullOrWhiteSpace($TenantId)) {
+        Write-Host "Connecting with setup service principal..."
+        $secureSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
+        $credential = New-Object System.Management.Automation.PSCredential($ClientId, $secureSecret)
+        Connect-AzAccount -ServicePrincipal -Tenant $TenantId -Credential $credential | Out-Null
+    }
+    else {
+        throw "No usable authentication path found. Provide existing Az context, -UseManagedIdentity, or -TenantId/-SetupClientId/-SetupClientSecret."
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($SubscriptionId)) {
+        Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
+    }
+
+    $context = Get-AzContext
+    if (-not $context) {
+        throw "Azure authentication failed. No Az context is available."
+    }
+
+    Write-Host "Connected as: $($context.Account.Id)"
+    Write-Host "Subscription: $($context.Subscription.Id)"
+    Write-Host "Tenant: $($context.Tenant.Id)"
+
+    return $context
+}
+
+function Get-CloudSliceResources {
+    param([string] $ResourceGroupName)
+
+    Write-Section "Discovering Cloud Slice resources"
+
+    $storageAccounts = if ([string]::IsNullOrWhiteSpace($ResourceGroupName)) {
+        Get-AzStorageAccount | Where-Object { $_.StorageAccountName -like "stcloudslice*" }
+    }
+    else {
+        Get-AzStorageAccount -ResourceGroupName $ResourceGroupName | Where-Object { $_.StorageAccountName -like "stcloudslice*" }
+    }
+
+    $storage = $storageAccounts | Select-Object -First 1
+    if (-not $storage) {
+        throw "Could not find a storage account named stcloudslice*. Pass -ResourceGroupName if discovery is ambiguous."
+    }
+
+    $rgName = $storage.ResourceGroupName
+
+    $vault = Get-AzKeyVault -ResourceGroupName $rgName | Where-Object { $_.VaultName -like "kv-cloudslice-*" } | Select-Object -First 1
+    if (-not $vault) {
+        throw "Could not find a Key Vault named kv-cloudslice-* in resource group '$rgName'."
+    }
+
+    $nsg = Get-AzNetworkSecurityGroup -ResourceGroupName $rgName | Where-Object { $_.Name -like "nsg-cloudslice-web-*" } | Select-Object -First 1
+    if (-not $nsg) {
+        Write-Warning "Could not find NSG named nsg-cloudslice-web-* in resource group '$rgName'. Attacker NSG activity will be skipped if this is script 04."
+    }
+
+    $staticSite = Get-AzResource -ResourceGroupName $rgName -ResourceType "Microsoft.Web/staticSites" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "swa-cloudslice-*" } |
+        Select-Object -First 1
+
+    $resourceGroup = Get-AzResourceGroup -Name $rgName
+
+    Write-Host "Resource group: $rgName"
+    Write-Host "Storage account: $($storage.StorageAccountName)"
+    Write-Host "Key Vault: $($vault.VaultName)"
+    if ($nsg) { Write-Host "NSG: $($nsg.Name)" }
+    if ($staticSite) { Write-Host "Static Web App: $($staticSite.Name)" }
+
+    return [pscustomobject]@{
+        ResourceGroup = $resourceGroup
+        ResourceGroupName = $rgName
+        Storage = $storage
+        KeyVault = $vault
+        NetworkSecurityGroup = $nsg
+        StaticSite = $staticSite
+    }
+}
+
+function Get-CurrentPrincipalObjectId {
+    $context = Get-AzContext
+    $accountId = $context.Account.Id
+
+    $sp = Get-AzADServicePrincipal -ApplicationId $accountId -ErrorAction SilentlyContinue
+    if ($sp) { return $sp.Id }
+
+    $spByDisplay = Get-AzADServicePrincipal -DisplayName $accountId -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($spByDisplay) { return $spByDisplay.Id }
+
+    $user = Get-AzADUser -UserPrincipalName $accountId -ErrorAction SilentlyContinue
+    if ($user) { return $user.Id }
+
+    Write-Warning "Could not resolve current principal object id for '$accountId'. Some role assignments may be skipped."
+    return $null
+}
+
+function Ensure-RoleAssignment {
+    param(
+        [Parameter(Mandatory=$true)][string] $ObjectId,
+        [Parameter(Mandatory=$true)][string] $RoleDefinitionName,
+        [Parameter(Mandatory=$true)][string] $Scope
+    )
+
+    $existing = Get-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $RoleDefinitionName -Scope $Scope -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Host "Role already assigned: $RoleDefinitionName on $Scope"
+        return
+    }
+
+    Write-Host "Assigning role: $RoleDefinitionName on $Scope"
+    New-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $RoleDefinitionName -Scope $Scope -ErrorAction Stop | Out-Null
+}
+
+function Get-SecretTextFromCredential {
+    param([object] $Credential)
+
+    foreach ($propertyName in @("SecretText", "SecretValue", "Value")) {
+        if ($Credential.PSObject.Properties.Name -contains $propertyName) {
+            $value = $Credential.$propertyName
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                return $value
             }
         }
     }
 
-    if ($AllowFailure) {
-        Write-Log "$ActionName failed after $MaxAttempts attempts. Continuing." 'WARN'
-        return $null
-    }
-
-    throw "$ActionName failed after $MaxAttempts attempts."
+    throw "The app credential was created, but the secret text was not returned by the installed Az.Resources version."
 }
 
-function Initialize-LabContext {
-    param(
-        [string]$SubscriptionId,
-        [string]$ResourceGroupName,
-        [string]$TenantId
-    )
 
-    $context = Get-AzContext -ErrorAction SilentlyContinue
-    if (-not $context) {
-        throw 'No Azure context found. Add Connect-AzAccount or use the Skillable authenticated LCA context before running this script.'
-    }
+Ensure-AzModule -ModuleNames @("Az.Accounts", "Az.Resources", "Az.KeyVault", "Az.Storage", "Az.Network")
 
-    if ([string]::IsNullOrWhiteSpace($SubscriptionId) -or $SubscriptionId -like '@lab.*') {
-        $SubscriptionId = $context.Subscription.Id
-        Write-Log "SubscriptionId was blank/tokenized. Using current context subscription: $SubscriptionId"
-    }
-
-    Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
-    $context = Get-AzContext -ErrorAction Stop
-
-    if ([string]::IsNullOrWhiteSpace($TenantId) -or $TenantId -like '@lab.*') {
-        $TenantId = $context.Tenant.Id
-        Write-Log "TenantId was blank/tokenized. Using current context tenant: $TenantId"
-    }
-
-    if ([string]::IsNullOrWhiteSpace($ResourceGroupName) -or $ResourceGroupName -like '@lab.*') {
-        Write-Log 'ResourceGroupName was blank/tokenized. Attempting to discover the Cloud Slice resource group.'
-        $candidateStorage = Get-AzStorageAccount -ErrorAction Stop |
-            Where-Object { $_.StorageAccountName -like 'stcloudslice*' } |
-            Select-Object -First 1
-
-        if (-not $candidateStorage) {
-            throw 'Could not discover the Cloud Slice resource group because no stcloudslice* storage account was found.'
-        }
-
-        $ResourceGroupName = $candidateStorage.ResourceGroupName
-        Write-Log "Discovered resource group: $ResourceGroupName"
-    }
-
-    [pscustomobject]@{
-        SubscriptionId = $SubscriptionId
-        ResourceGroupName = $ResourceGroupName
-        TenantId = $TenantId
-    }
-}
-
-function Get-CloudSliceResources {
-    param([Parameter(Mandatory = $true)][string]$ResourceGroupName)
-
-    $storage = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -ErrorAction Stop |
-        Where-Object { $_.StorageAccountName -like 'stcloudslice*' } |
-        Select-Object -First 1
-
-    $keyVault = Get-AzKeyVault -ResourceGroupName $ResourceGroupName -ErrorAction Stop |
-        Where-Object { $_.VaultName -like 'kv-cloudslice-*' } |
-        Select-Object -First 1
-
-    $nsg = Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroupName -ErrorAction Stop |
-        Where-Object { $_.Name -like 'nsg-cloudslice-web-*' } |
-        Select-Object -First 1
-
-    $staticWebApp = Get-AzResource -ResourceGroupName $ResourceGroupName -ResourceType 'Microsoft.Web/staticSites' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like 'swa-cloudslice-*' } |
-        Select-Object -First 1
-
-    if (-not $storage) { throw "Cloud Slice storage account not found in resource group '$ResourceGroupName'." }
-    if (-not $keyVault) { throw "Cloud Slice Key Vault not found in resource group '$ResourceGroupName'." }
-    if (-not $nsg) { throw "Cloud Slice NSG not found in resource group '$ResourceGroupName'." }
-
-    [pscustomobject]@{
-        StorageAccountName = $storage.StorageAccountName
-        StorageAccountId   = $storage.Id
-        KeyVaultName       = $keyVault.VaultName
-        KeyVaultId         = $keyVault.ResourceId
-        NsgName            = $nsg.Name
-        NsgId              = $nsg.Id
-        StaticWebAppName   = if ($staticWebApp) { $staticWebApp.Name } else { $null }
-    }
-}
-
-Write-Log 'Starting LCA 02: seed Cloud Slice artifacts.'
-
-$lab = Initialize-LabContext -SubscriptionId $SubscriptionId -ResourceGroupName $ResourceGroupName -TenantId $TenantId
-$SubscriptionId = $lab.SubscriptionId
-$ResourceGroupName = $lab.ResourceGroupName
-$TenantId = $lab.TenantId
-
-$contextPath = 'C:\CloudSlice\svc-cloudslice-deploy.json'
-if (-not (Test-Path $contextPath)) {
-    throw "Missing $contextPath. Run 01-create-compromised-sp.ps1 first."
-}
-
-$ctx = Get-Content $contextPath -Raw | ConvertFrom-Json
+$context = Connect-CloudSliceAz -SubscriptionId $SubscriptionId -TenantId $TenantId -ClientId $SetupClientId -ClientSecret $SetupClientSecret -UseManagedIdentity:$UseManagedIdentity
 $resources = Get-CloudSliceResources -ResourceGroupName $ResourceGroupName
 
-$storageAccount = Get-AzStorageAccount `
-    -ResourceGroupName $ResourceGroupName `
-    -Name $resources.StorageAccountName `
-    -ErrorAction Stop
+Write-Section "Finding compromised identity"
+$app = Get-AzADApplication -DisplayName "svc-cloudslice-deploy" -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $app) {
+    throw "Could not find app registration svc-cloudslice-deploy. Run script 01 first."
+}
 
-$storageContext = $storageAccount.Context
+$storageContext = New-AzStorageContext -StorageAccountName $resources.Storage.StorageAccountName -UseConnectedAccount
 
-$seedRoot = 'C:\CloudSlice\seed'
-New-Item -ItemType Directory -Path $seedRoot -Force | Out-Null
-New-Item -ItemType Directory -Path "$seedRoot\site" -Force | Out-Null
-New-Item -ItemType Directory -Path "$seedRoot\repo" -Force | Out-Null
-New-Item -ItemType Directory -Path "$seedRoot\business" -Force | Out-Null
+function Ensure-Container {
+    param([string] $Name)
+    $container = Get-AzStorageContainer -Context $storageContext -Name $Name -ErrorAction SilentlyContinue
+    if (-not $container) {
+        Write-Host "Creating container: $Name"
+        New-AzStorageContainer -Context $storageContext -Name $Name -Permission Off | Out-Null
+    }
+    else {
+        Write-Host "Container already exists: $Name"
+    }
+}
 
-@"
-External Researcher Report - North South Traders
+function Upload-TextBlob {
+    param(
+        [string] $Container,
+        [string] $BlobName,
+        [string] $Content
+    )
+
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("CloudSliceSeed-" + [guid]::NewGuid().ToString("n"))
+    New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+    try {
+        $filePath = Join-Path $tempRoot ($BlobName -replace "[\\/]", "_")
+        Set-Content -Path $filePath -Value $Content -Encoding UTF8
+        Set-AzStorageBlobContent -Context $storageContext -Container $Container -File $filePath -Blob $BlobName -Force | Out-Null
+        Write-Host "Uploaded: $Container/$BlobName"
+    }
+    finally {
+        Remove-Item -Path $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Section "Preparing containers"
+foreach ($containerName in @("investigation-artifacts", "business-files", "web-content")) {
+    Ensure-Container -Name $containerName
+}
+
+Write-Section "Uploading investigation and business artifacts"
+
+$researcherReport = @"
+Cloud Slice Researcher Report
 
 Summary:
-A public repository appears to contain automation configuration for the Cloud Slice Portal. The exposed values reference an application identity named svc-cloudslice-deploy.
+A public configuration sample appears to reference the deployment identity svc-cloudslice-deploy.
+The identity may have broader permissions than required.
 
-Observed values:
-tenantId=$TenantId
-clientId=$($ctx.ClientId)
-keyVaultName=$($ctx.KeyVaultName)
-secretName=svc-cloudslice-deploy-client-secret
-observedSource=198.51.100.23/32
+Observed indicators:
+- Workload identity display name: svc-cloudslice-deploy
+- Possible exposed application configuration file: appsettings.production.json
+- Storage paths of interest: business-files/operations and business-files/exports
+- Key Vault secret pattern: svc-cloudslice-deploy-client-secret
 
-Initial recommendation:
-Confirm whether this workload identity recently authenticated, review resource changes, rotate or delete the credential, and reduce its privileges.
-"@ | Set-Content -Path "$seedRoot\researcher-report.txt" -Encoding UTF8
+Recommended investigation:
+1. Review Entra application and service principal activity.
+2. Review role assignments scoped to the resource group, storage account, and Key Vault.
+3. Review storage access patterns.
+4. Review recent NSG and resource group tag changes.
+"@
 
-@"
-# appsettings.production.json
-# Recovered from public repository cache.
-
+$leakedConfig = @"
 {
-  "CloudSlice": {
-    "TenantId": "$TenantId",
-    "ClientId": "$($ctx.ClientId)",
-    "KeyVaultName": "$($ctx.KeyVaultName)",
-    "SecretName": "svc-cloudslice-deploy-client-secret",
-    "StorageContainer": "business-files"
-  }
+  "Application": "CloudSlice.Web",
+  "Environment": "Production",
+  "DeploymentIdentity": "svc-cloudslice-deploy",
+  "KeyVaultSecretName": "svc-cloudslice-deploy-client-secret",
+  "StorageAccount": "$($resources.Storage.StorageAccountName)",
+  "Warning": "Sample configuration only. Do not store production identity references in public repositories."
 }
-"@ | Set-Content -Path "$seedRoot\repo\appsettings.production.json" -Encoding UTF8
+"@
 
-@"
-Cloud Slice deployment note
+$deploymentNotes = @"
+Cloud Slice Operations Deployment Notes
 
-The deployment automation identity svc-cloudslice-deploy was temporarily granted broad resource group permissions during initial rollout.
-This should be reduced after validation.
+Deployment owner: platform operations
+Current deployment identity: svc-cloudslice-deploy
+Storage account: $($resources.Storage.StorageAccountName)
+Key Vault: $($resources.KeyVault.VaultName)
 
-Known follow-up items:
-- Move the workload to managed identity.
-- Remove secret-based authentication.
-- Review network security group changes.
-- Limit storage access to required containers only.
-"@ | Set-Content -Path "$seedRoot\business\deployment-notes.txt" -Encoding UTF8
+Temporary exception process:
+Remote administrative access must be approved and time-bound.
+Any NSG rule for remote access should be reviewed immediately.
+"@
 
-@"
-TicketId,Region,Status,Priority,AssignedTeam
-10041,North,Open,Medium,Support
-10042,South,Closed,Low,Fulfillment
-10043,Central,Open,High,Cloud Operations
-10044,East,Open,Medium,Support
-"@ | Set-Content -Path "$seedRoot\business\customer-queue.csv" -Encoding UTF8
+$customerQueue = @"
+TicketId,Priority,Customer,Status
+CS-1001,High,Northwind Research,Pending Review
+CS-1002,Medium,Contoso Energy,Waiting on Operations
+CS-1003,Low,Fabrikam Health,Queued
+"@
 
-@'
+$indexHtml = @"
 <!doctype html>
-<html lang="en">
+<html>
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>North South Traders | Cloud Slice Portal</title>
-  <style>
-    body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:#f6f8fb;color:#172033}
-    header{background:#12213f;color:white;padding:28px 48px}
-    .nav{display:flex;justify-content:space-between;align-items:center}
-    .brand{font-size:22px;font-weight:700}.pill{background:#2b72ff;padding:8px 12px;border-radius:999px;font-size:13px}
-    .hero{padding:56px 48px;background:linear-gradient(135deg,#12213f,#2357a6);color:white}
-    .hero h1{max-width:820px;font-size:42px;line-height:1.1;margin:0 0 16px}.hero p{max-width:760px;font-size:18px;line-height:1.5}
-    .cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px;padding:36px 48px}.card{background:white;border-radius:16px;padding:24px;box-shadow:0 8px 24px rgba(18,33,63,.08)}
-    .card h2{font-size:20px;margin:0 0 10px}.status{display:inline-block;margin-top:14px;color:#0f7b35;background:#e8f7ed;padding:6px 10px;border-radius:999px;font-size:13px}
-    .footer{padding:24px 48px;color:#5c667a;font-size:13px}@media(max-width:800px){.cards{grid-template-columns:1fr}.hero h1{font-size:32px}}
-  </style>
+  <title>Cloud Slice</title>
 </head>
 <body>
-<header><div class="nav"><div class="brand">North South Traders</div><div class="pill">Cloud Slice Portal</div></div></header>
-<section class="hero"><h1>Secure access to customer operations, fulfillment metrics, and regional cloud services.</h1><p>The Cloud Slice Portal provides lightweight operational visibility for support, fulfillment, and application teams across North South Traders.</p></section>
-<section class="cards">
-  <article class="card"><h2>Customer Operations</h2><p>Review regional request queues, support handoffs, and application health summaries.</p><span class="status">Operational</span></article>
-  <article class="card"><h2>Fulfillment Insights</h2><p>Track pipeline health, partner status, and daily processing volume.</p><span class="status">Operational</span></article>
-  <article class="card"><h2>Cloud Automation</h2><p>Deployment and maintenance automation runs under approved service identities.</p><span class="status">Monitoring</span></article>
-</section>
-<div class="footer">Internal portal mockup for lab use. No production customer data is stored on this site.</div>
+  <h1>Cloud Slice Research Workspace</h1>
+  <p>Internal research portal for Cloud Slice operations.</p>
 </body>
 </html>
-'@ | Set-Content -Path "$seedRoot\site\index.html" -Encoding UTF8
+"@
 
-Write-Log 'Uploading investigation and business artifacts to blob storage.'
+Upload-TextBlob -Container "investigation-artifacts" -BlobName "researcher-report.txt" -Content $researcherReport
+Upload-TextBlob -Container "investigation-artifacts" -BlobName "leaked-repo/appsettings.production.json" -Content $leakedConfig
+Upload-TextBlob -Container "business-files" -BlobName "operations/deployment-notes.txt" -Content $deploymentNotes
+Upload-TextBlob -Container "business-files" -BlobName "exports/customer-queue.csv" -Content $customerQueue
+Upload-TextBlob -Container "web-content" -BlobName "index.html" -Content $indexHtml
 
-Set-AzStorageBlobContent -Context $storageContext -Container 'investigation-artifacts' -File "$seedRoot\researcher-report.txt" -Blob 'researcher-report.txt' -Force -ErrorAction Stop | Out-Null
-Set-AzStorageBlobContent -Context $storageContext -Container 'investigation-artifacts' -File "$seedRoot\repo\appsettings.production.json" -Blob 'leaked-repo/appsettings.production.json' -Force -ErrorAction Stop | Out-Null
-Set-AzStorageBlobContent -Context $storageContext -Container 'business-files' -File "$seedRoot\business\deployment-notes.txt" -Blob 'operations/deployment-notes.txt' -Force -ErrorAction Stop | Out-Null
-Set-AzStorageBlobContent -Context $storageContext -Container 'business-files' -File "$seedRoot\business\customer-queue.csv" -Blob 'exports/customer-queue.csv' -Force -ErrorAction Stop | Out-Null
-Set-AzStorageBlobContent -Context $storageContext -Container 'web-content' -File "$seedRoot\site\index.html" -Blob 'index.html' -Force -ErrorAction Stop | Out-Null
-
-$desktop = [Environment]::GetFolderPath('Desktop')
-if (-not [string]::IsNullOrWhiteSpace($desktop) -and (Test-Path $desktop)) {
-    Copy-Item "$seedRoot\researcher-report.txt" "$desktop\Cloud Slice - Researcher Report.txt" -Force
-    Write-Log "Copied starting clue to $desktop\Cloud Slice - Researcher Report.txt"
-}
-else {
-    Write-Log 'Desktop path not found. Skipping local clue copy.' 'WARN'
-}
-
-Write-Log "Static Web App resource: $($resources.StaticWebAppName)"
-Write-Log 'LCA 02 complete.'
+Write-Section "Complete"
+Write-Host "Cloud Slice seed artifacts were uploaded."
