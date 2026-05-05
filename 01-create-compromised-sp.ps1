@@ -1,4 +1,9 @@
-#requires -Modules Az.Accounts,Az.Resources,Az.Storage,Az.KeyVault,Az.Network
+param(
+    [string]$SubscriptionId = '@lab.CloudSubscription.Id',
+    [string]$ResourceGroupName = '@lab.CloudResourceGroup(RG1).Name',
+    [string]$TenantId = '@lab.CloudTenant.Id',
+    [string]$AppDisplayName = 'svc-cloudslice-deploy'
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -7,7 +12,6 @@ function Write-Log {
         [Parameter(Mandatory = $true)][string]$Message,
         [ValidateSet('INFO','WARN','ERROR')][string]$Level = 'INFO'
     )
-
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     Write-Output "[$timestamp] [$Level] $Message"
 }
@@ -122,13 +126,6 @@ function Get-CloudSliceResources {
     }
 }
 
-param(
-    [string]$SubscriptionId = '@lab.CloudSubscription.Id',
-    [string]$ResourceGroupName = '@lab.CloudResourceGroup(RG1).Name',
-    [string]$TenantId = '@lab.CloudTenant.Id',
-    [string]$AppDisplayName = 'svc-cloudslice-deploy'
-)
-
 Write-Log 'Starting LCA 01: create compromised service principal.'
 
 $lab = Initialize-LabContext -SubscriptionId $SubscriptionId -ResourceGroupName $ResourceGroupName -TenantId $TenantId
@@ -177,19 +174,33 @@ if ([string]::IsNullOrWhiteSpace($clientSecret)) {
     throw 'New-AzADAppCredential did not return SecretText.'
 }
 
+$currentAccount = (Get-AzContext).Account.Id
+if (-not [string]::IsNullOrWhiteSpace($currentAccount)) {
+    Write-Log "Ensuring current setup account has Key Vault Secrets Officer on $($resources.KeyVaultName)."
+    Invoke-WithRetry -ActionName 'Assign Key Vault Secrets Officer to current setup account' -ScriptBlock {
+        New-AzRoleAssignment `
+            -SignInName $currentAccount `
+            -RoleDefinitionName 'Key Vault Secrets Officer' `
+            -Scope $resources.KeyVaultId `
+            -ErrorAction Stop | Out-Null
+    } -AllowFailure
+}
+
 Write-Log 'Storing client secret in Key Vault.'
 $secureSecret = ConvertTo-SecureString -String $clientSecret -AsPlainText -Force
-Set-AzKeyVaultSecret `
-    -VaultName $resources.KeyVaultName `
-    -Name 'svc-cloudslice-deploy-client-secret' `
-    -SecretValue $secureSecret `
-    -ContentType 'client-secret' `
-    -Tag @{
-        owner = 'Cloud Slice DevOps'
-        rotation = 'overdue'
-        labPurpose = 'investigation-evidence'
-    } `
-    -ErrorAction Stop | Out-Null
+Invoke-WithRetry -ActionName 'Store svc-cloudslice-deploy secret in Key Vault' -MaxAttempts 10 -DelaySeconds 20 -ScriptBlock {
+    Set-AzKeyVaultSecret `
+        -VaultName $resources.KeyVaultName `
+        -Name 'svc-cloudslice-deploy-client-secret' `
+        -SecretValue $secureSecret `
+        -ContentType 'client-secret' `
+        -Tag @{
+            owner = 'Cloud Slice DevOps'
+            rotation = 'overdue'
+            labPurpose = 'investigation-evidence'
+        } `
+        -ErrorAction Stop | Out-Null
+}
 
 $secret = Get-AzKeyVaultSecret `
     -VaultName $resources.KeyVaultName `
