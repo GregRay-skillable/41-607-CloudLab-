@@ -15,6 +15,36 @@ function Write-Log {
     Write-Output "[$timestamp] [$Level] $Message"
 }
 
+function Invoke-WithRetry {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock,
+        [int]$MaxAttempts = 8,
+        [int]$DelaySeconds = 15,
+        [switch]$AllowFailure,
+        [string]$ActionName = 'operation'
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            Write-Log "Running $ActionName. Attempt $attempt of $MaxAttempts."
+            return & $ScriptBlock
+        }
+        catch {
+            Write-Log "$ActionName failed on attempt $attempt. $($_.Exception.Message)" 'WARN'
+            if ($attempt -lt $MaxAttempts) {
+                Start-Sleep -Seconds $DelaySeconds
+            }
+        }
+    }
+
+    if ($AllowFailure) {
+        Write-Log "$ActionName failed after $MaxAttempts attempts. Continuing." 'WARN'
+        return $null
+    }
+
+    throw "$ActionName failed after $MaxAttempts attempts."
+}
+
 function Initialize-LabContext {
     param(
         [string]$SubscriptionId,
@@ -117,7 +147,6 @@ $storageAccount = Get-AzStorageAccount `
     -Name $resources.StorageAccountName `
     -ErrorAction Stop
 
-# Normal read/list activity.
 Write-Log 'Generating benign resource read activity.'
 Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop | Out-Null
 Get-AzResource -ResourceGroupName $ResourceGroupName -ErrorAction Stop | Out-Null
@@ -134,7 +163,6 @@ if ($resources.StaticWebAppName) {
         -ErrorAction SilentlyContinue | Out-Null
 }
 
-# Harmless control-plane change to create support-user noise.
 Write-Log 'Applying harmless helpDeskSupport review tags to the resource group.'
 
 $rg = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop
