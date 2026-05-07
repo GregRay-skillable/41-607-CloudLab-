@@ -1,14 +1,20 @@
 param(
     [string]$SubscriptionId = '@lab.CloudSubscription.Id',
-    [string]$ResourceGroupName = '@lab.CloudResourceGroup(RG1).Name',
+    [string]$ResourceGroupName = '@lab.CloudResourceGroup(NS-RG1).Name',
     [string]$TenantId = '@lab.CloudTenant.Id',
-    [string]$AppDisplayName = 'svc-cloudslice-deploy',
+    [string]$AppDisplayName = 'svc-northSouth-@lab.LabInstance.Id',
     [string]$ArtifactContainerName = 'investigation-artifacts'
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$InformationPreference = 'Continue'
+
+$safeAppName = $AppDisplayName.ToLower() -replace '[^a-z0-9-]', '-'
+$safeAppName = $safeAppName.Trim('-')
+
+$secretName = "$safeAppName-client-secret"
+$contextFileName = "$safeAppName.json"
+$contextBlobName = "setup/$contextFileName"
 
 function Write-Log {
     param(
@@ -17,7 +23,7 @@ function Write-Log {
     )
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    Write-Information "[$timestamp] [$Level] $Message"
+    [System.Console]::Out.WriteLine("[$timestamp] [$Level] $Message")
 }
 
 function Test-IsSkillableTokenOrBlank {
@@ -44,7 +50,9 @@ function Invoke-WithRetry {
         }
         catch {
             Write-Log "$ActionName failed on attempt $attempt. $($_.Exception.Message)" 'WARN'
-            if ($attempt -lt $MaxAttempts) { Start-Sleep -Seconds $DelaySeconds }
+            if ($attempt -lt $MaxAttempts) {
+                Start-Sleep -Seconds $DelaySeconds
+            }
         }
     }
 
@@ -440,6 +448,10 @@ function Ensure-ArtifactContainer {
 
 try {
     Write-Log 'Starting LCA 01: create compromised service principal.'
+    Write-Log "App display name: $AppDisplayName"
+    Write-Log "Safe app name: $safeAppName"
+    Write-Log "Secret name: $secretName"
+    Write-Log "Context artifact blob: $contextBlobName"
 
     $lab = Initialize-LabContext -SubscriptionId $SubscriptionId -ResourceGroupName $ResourceGroupName -TenantId $TenantId
     $SubscriptionId = $lab.SubscriptionId
@@ -470,32 +482,36 @@ try {
     Write-Log 'Creating client secret.'
     $credential = New-CloudSliceClientSecret -AppId $appId
     $clientSecret = $credential.SecretText
-    if ([string]::IsNullOrWhiteSpace($clientSecret)) { throw 'Client secret was empty after credential creation.' }
+
+    if ([string]::IsNullOrWhiteSpace($clientSecret)) {
+        throw 'Client secret was empty after credential creation.'
+    }
 
     Grant-CurrentPrincipalKeyVaultSecretAccess -VaultName $resources.KeyVaultName -VaultId $resources.KeyVaultId
 
-    Write-Log 'Storing client secret in Key Vault.'
+    Write-Log "Storing client secret in Key Vault as '$secretName'."
     $secureSecret = ConvertTo-SecureString -String $clientSecret -AsPlainText -Force
 
     Invoke-WithRetry `
-        -ActionName 'Store svc-cloudslice-deploy secret in Key Vault' `
+        -ActionName "Store $AppDisplayName client secret in Key Vault" `
         -MaxAttempts 12 `
         -DelaySeconds 20 `
         -ScriptBlock {
             Set-AzKeyVaultSecret `
                 -VaultName $resources.KeyVaultName `
-                -Name 'svc-cloudslice-deploy-client-secret' `
+                -Name $secretName `
                 -SecretValue $secureSecret `
                 -ContentType 'client-secret' `
                 -Tag @{
                     owner      = 'Cloud Slice DevOps'
                     rotation   = 'overdue'
                     labPurpose = 'investigation-evidence'
+                    appName    = $AppDisplayName
                 } `
                 -ErrorAction Stop | Out-Null
         } | Out-Null
 
-    $secret = Get-AzKeyVaultSecret -VaultName $resources.KeyVaultName -Name 'svc-cloudslice-deploy-client-secret' -ErrorAction Stop
+    $secret = Get-AzKeyVaultSecret -VaultName $resources.KeyVaultName -Name $secretName -ErrorAction Stop
     $secretUri = $secret.Id
 
     Write-Log 'Assigning intentionally excessive Contributor access at resource group scope.'
@@ -511,10 +527,10 @@ try {
     $keyVaultAuthorization = Get-AzKeyVault -VaultName $resources.KeyVaultName -ErrorAction Stop
 
     if (-not $keyVaultAuthorization.EnableRbacAuthorization) {
-        Write-Log "Key Vault '$($resources.KeyVaultName)' is using access policy mode. Granting svc-cloudslice-deploy get/list secret access with a Key Vault access policy."
+        Write-Log "Key Vault '$($resources.KeyVaultName)' is using access policy mode. Granting $AppDisplayName get/list secret access with a Key Vault access policy."
 
         Invoke-WithRetry `
-            -ActionName 'Grant Key Vault access policy to svc-cloudslice-deploy' `
+            -ActionName "Grant Key Vault access policy to $AppDisplayName" `
             -MaxAttempts 8 `
             -DelaySeconds 20 `
             -ScriptBlock {
@@ -535,23 +551,25 @@ try {
     Write-Log 'Writing context artifact to the investigation-artifacts container for cloud-target continuity.'
 
     $workRoot = Get-CloudSliceWorkRoot
-    $contextPath = Join-Path $workRoot 'svc-cloudslice-deploy.json'
+    $contextPath = Join-Path $workRoot $contextFileName
 
     [ordered]@{
         TenantId                 = $TenantId
         SubscriptionId           = $SubscriptionId
         ResourceGroupName        = $ResourceGroupName
         AppDisplayName           = $AppDisplayName
+        SafeAppName              = $safeAppName
         ClientId                 = $appId
         ServicePrincipalObjectId = $sp.Id
         KeyVaultName             = $resources.KeyVaultName
         KeyVaultId               = $resources.KeyVaultId
-        SecretName               = 'svc-cloudslice-deploy-client-secret'
+        SecretName               = $secretName
         SecretUri                = $secretUri
         StorageAccountName       = $resources.StorageAccountName
         StorageAccountId         = $resources.StorageAccountId
         NsgName                  = $resources.NsgName
         StaticWebAppName         = $resources.StaticWebAppName
+        ContextBlobName          = $contextBlobName
     } | ConvertTo-Json -Depth 6 | Set-Content -Path $contextPath -Encoding UTF8
 
     $storageAccount = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $resources.StorageAccountName -ErrorAction Stop
@@ -561,20 +579,23 @@ try {
         Ensure-ArtifactContainer -StorageContext $storageContext -ContainerName $ArtifactContainerName
     } | Out-Null
 
-    Invoke-WithRetry -ActionName 'Upload svc-cloudslice-deploy context artifact' -MaxAttempts 8 -DelaySeconds 15 -ScriptBlock {
+    Invoke-WithRetry -ActionName "Upload $AppDisplayName context artifact" -MaxAttempts 8 -DelaySeconds 15 -ScriptBlock {
         Set-AzStorageBlobContent `
             -Context $storageContext `
             -Container $ArtifactContainerName `
             -File $contextPath `
-            -Blob 'setup/svc-cloudslice-deploy.json' `
+            -Blob $contextBlobName `
             -Force `
             -ErrorAction Stop | Out-Null
     } | Out-Null
 
+    Write-Log "Context artifact uploaded to $ArtifactContainerName/$contextBlobName"
     Write-Log 'LCA 01 complete.'
 }
 catch {
     Write-Log "LCA 01 failed. $($_.Exception.Message)" 'ERROR'
-    if ($_.ScriptStackTrace) { Write-Log $_.ScriptStackTrace 'ERROR' }
+    if ($_.ScriptStackTrace) {
+        Write-Log $_.ScriptStackTrace 'ERROR'
+    }
     throw
 }
