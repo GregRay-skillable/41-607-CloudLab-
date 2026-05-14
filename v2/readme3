@@ -1,0 +1,33 @@
+# NorthSound Cumulus Services SQL ARM update
+
+This package keeps the earlier speed-focused cleanup that removed Static Web App and Application Insights, then adds Azure SQL to the ARM template.
+
+## Added to the ARM template
+
+The ARM template now creates the following SQL resources when `deploySqlResources` is `true`:
+
+- Azure SQL logical server: `sql-nscs-platform-<suffix>`
+- Optional Azure SQL Database: `sqldb-customer-index`
+- SQL firewall rule: `AllowAzureServices`
+
+The optional database is intentionally lightweight and does not use `sampleName = AdventureWorksLT`. That avoids reintroducing the slower sample database deployment path from the old LCA.
+
+## New ARM parameters
+
+- `deploySqlResources` defaults to `true`.
+- `deploySqlDatabase` defaults to `true`.
+- `sqlAdministratorLogin` defaults to `nscsadmin`.
+- `sqlAdministratorPassword` defaults to `@lab.CloudPortalCredential(User1).Password`.
+- `sqlDatabaseName` defaults to `sqldb-customer-index`.
+
+If Skillable does not token-replace the secure string default in your ARM deployment flow, pass `sqlAdministratorPassword` explicitly through the template parameters file.
+
+## Updated scripts
+
+- The evidence seeding script now discovers `sql-nscs-platform-*` and includes SQL server details, plus database details when the optional database exists, in the evidence summary, deployment log, incident notes, and investigation guide.
+- The validation LCA now checks for the SQL logical server. It does not require the optional database, so you can set `deploySqlDatabase` to `false` without breaking validation.
+- The management-plane activity LCA now tags the SQL server as platform metadata during activity generation.
+
+## Recommendation
+
+Remove or disable the old `Deploy sample database` LCA if you enable SQL in this ARM template. Keeping both will create duplicate SQL work and may slow the lab down.
