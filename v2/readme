@@ -1,0 +1,74 @@
+# NSCS Lab Organized Deliverables
+
+This package is organized by where each item belongs.
+
+## 01_ARM_Template
+
+Use this ARM template as the main infrastructure deployment template.
+
+- `azuredeploy-nscs-storage-exposure.json`
+
+Includes:
+- Storage account
+- Storage containers
+- Key Vault
+- VNet
+- Subnet
+- NSG
+- Log Analytics
+- Diagnostic settings
+- Optional SQL Server and lightweight database
+
+Removed from the prior ARM:
+- Static Web App
+- Application Insights
+
+## 02_Skillable_LCAs
+
+Paste these into Skillable Lifecycle Actions.
+
+Recommended order:
+
+1. `lca-01-create-compromised-service-principal.ps1`
+2. `lca-02-seed-nscs-evidence.ps1`
+3. `lca-03-validate-nscs-lab-state.ps1`
+4. `lca-04-generate-management-plane-activity.ps1`
+
+Recommended LCA names:
+
+| File | Skillable LCA name |
+|---|---|
+| `lca-01-create-compromised-service-principal.ps1` | Create compromised service principal |
+| `lca-02-seed-nscs-evidence.ps1` | Seed NSCS storage exposure evidence |
+| `lca-03-validate-nscs-lab-state.ps1` | Validate NSCS lab state |
+| `lca-04-generate-management-plane-activity.ps1` | Generate management-plane activity |
+
+## 03_GitHub_DropIns
+
+Upload these to the GitHub repo currently used by your LCA launchers.
+
+Keep these filenames unchanged unless you also update the launcher URLs:
+
+- `01-create-compromised-sp.ps1`
+- `02-seed-cloudslice-evidence.ps1`
+
+## 04_Optional_Deprecated
+
+This contains the old-style SQL LCA script with updated NSCS naming.
+
+Do not use it if SQL is deployed from the ARM template.
+
+- `optional-deploy-sample-database-nscs.ps1`
+
+## 05_Documentation
+
+Reference notes for the changes.
+
+- `README-nscs-drop-in-changes.md`
+- `README-nscs-sql-arm-update.md`
+
+## Important
+
+If the ARM template deploys SQL, disable the separate Deploy sample database LCA to avoid duplicate SQL work.
+
+If the Skillable environment does not already have the Microsoft.Sql resource provider registered before ARM deployment, either register it before deployment or set `deploySqlResources` to `false`.
