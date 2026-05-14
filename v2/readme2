@@ -1,0 +1,52 @@
+# NorthSound Cumulus Services drop-in updates
+
+## What changed
+
+- Removed Static Web App from the ARM template.
+- Removed Application Insights from the ARM template.
+- Kept Log Analytics and diagnostic settings.
+- Added Azure SQL logical server, optional lightweight database, and Azure-services firewall rule to the ARM template.
+- Rebranded the resource names from Cloud Slice to NorthSound Cumulus Services / NSCS.
+- Updated service principal naming to `svc-nscs-storage-sync-@lab.LabInstance.Id`.
+- Updated storage containers:
+  - `security-evidence`
+  - `customer-exports`
+  - `portal-content`
+- Updated the suspicious persistent NSG rule to `AllowVendorSupportRDP`.
+- Updated temporary activity-log noise names to look more operationally realistic.
+- Kept the GitHub script filenames the same for the two downloaded scripts:
+  - `01-create-compromised-sp.ps1`
+  - `02-seed-cloudslice-evidence.ps1`
+
+## Files
+
+- `azuredeploy-nscs-storage-exposure.json`
+  - Drop-in ARM template replacement.
+- `01-create-compromised-sp.ps1`
+  - Replace the GitHub-hosted script with this content.
+- `02-seed-cloudslice-evidence.ps1`
+  - Replace the GitHub-hosted script with this content.
+- `lca-01-create-compromised-service-principal.ps1`
+  - Replace the Skillable LCA launcher content for creating the service principal.
+- `lca-02-seed-nscs-evidence.ps1`
+  - Replace the Skillable LCA launcher content for seeding evidence.
+- `lca-03-validate-nscs-lab-state.ps1`
+  - Replace the validation LCA content.
+- `lca-04-generate-management-plane-activity.ps1`
+  - Replace the management-plane activity LCA content.
+- `optional-deploy-sample-database-nscs.ps1`
+  - Legacy optional SQL database LCA. Do not run this if SQL is enabled in the ARM template.
+- `README-nscs-sql-arm-update.md`
+  - Notes for the SQL ARM integration.
+
+## Important implementation notes
+
+- The ARM template no longer outputs `applicationInsightsName`, `staticWebAppName`, or `staticWebAppDefaultHostname`.
+- The ARM template now outputs `sqlServerName`, `sqlDatabaseName`, and `sqlFirewallRuleName`.
+- The Key Vault name uses `kv-nscs-sec-<suffix>` instead of `kv-nscs-platform-<suffix>` to stay inside the Azure Key Vault 24-character name limit.
+- The two GitHub-hosted script filenames were intentionally preserved to avoid forcing you to change launcher URLs.
+- If your lab instructions currently reference `Cloud Slice`, `investigation-artifacts`, `business-files`, or `web-content`, update those references to the new NSCS names.
+
+## SQL ARM integration
+
+SQL is now deployed by `azuredeploy-nscs-storage-exposure.json` using `sql-nscs-platform-<suffix>`. The optional lightweight database uses `sqldb-customer-index`. Disable or remove the old `Deploy sample database` LCA to avoid duplicate SQL work.
