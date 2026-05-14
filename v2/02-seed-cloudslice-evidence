@@ -1,0 +1,700 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$SubscriptionId,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ResourceGroupName,
+
+    [Parameter(Mandatory = $true)]
+    [string]$TenantId,
+
+    [Parameter(Mandatory = $true)]
+    [string]$AppDisplayName,
+
+    [Parameter(Mandatory = $false)]
+    [string]$LabInstanceId = ''
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$WarningPreference = 'SilentlyContinue'
+$InformationPreference = 'SilentlyContinue'
+$VerbosePreference = 'SilentlyContinue'
+$DebugPreference = 'SilentlyContinue'
+
+function Test-IsSkillableTokenOrBlank {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+    if ($Value.Trim().StartsWith('@lab.')) { return $true }
+
+    return $false
+}
+
+function ConvertTo-SafeName {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    $safe = $Value.ToLowerInvariant()
+    $safe = $safe -replace '[^a-z0-9-]', '-'
+    $safe = $safe -replace '-+', '-'
+    $safe = $safe.Trim('-')
+
+    if ([string]::IsNullOrWhiteSpace($safe)) {
+        $safe = 'svc-nscs-storage-sync'
+    }
+
+    return $safe
+}
+
+function Invoke-WithRetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$ScriptBlock,
+
+        [int]$MaxAttempts = 6,
+
+        [int]$DelaySeconds = 15,
+
+        [string]$ActionName = 'operation'
+    )
+
+    $lastError = $null
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            return & $ScriptBlock
+        }
+        catch {
+            $lastError = $_
+            if ($attempt -lt $MaxAttempts) {
+                Start-Sleep -Seconds $DelaySeconds
+            }
+        }
+    }
+
+    throw "$ActionName failed after $MaxAttempts attempts. $($lastError.Exception.Message)"
+}
+
+function Resolve-NSCSResourceGroup {
+    param([string]$RequestedResourceGroupName)
+
+    if (-not (Test-IsSkillableTokenOrBlank -Value $RequestedResourceGroupName)) {
+        return [string]$RequestedResourceGroupName
+    }
+
+    $storage = Get-AzStorageAccount -ErrorAction SilentlyContinue |
+        Where-Object { $_.StorageAccountName -like 'stnscsdata*' } |
+        Select-Object -First 1
+
+    if ($storage) {
+        return [string]$storage.ResourceGroupName
+    }
+
+    $kv = Get-AzResource -ResourceType 'Microsoft.KeyVault/vaults' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like 'kv-nscs-sec-*' } |
+        Select-Object -First 1
+
+    if ($kv) {
+        return [string]$kv.ResourceGroupName
+    }
+
+    throw 'Could not resolve the NorthSound Cumulus resource group.'
+}
+
+function Ensure-Container {
+    param(
+        [Parameter(Mandatory = $true)]$StorageContext,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $container = Get-AzStorageContainer `
+        -Context $StorageContext `
+        -Name $Name `
+        -ErrorAction SilentlyContinue
+
+    if (-not $container) {
+        New-AzStorageContainer `
+            -Context $StorageContext `
+            -Name $Name `
+            -Permission Off `
+            -ErrorAction Stop | Out-Null
+    }
+}
+
+function Set-TextBlob {
+    param(
+        [Parameter(Mandatory = $true)]$StorageContext,
+        [Parameter(Mandatory = $true)][string]$ContainerName,
+        [Parameter(Mandatory = $true)][string]$BlobName,
+        [Parameter(Mandatory = $true)][string]$Content
+    )
+
+    $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
+
+    try {
+        [System.IO.File]::WriteAllText($tempFile, $Content, [System.Text.UTF8Encoding]::new($false))
+
+        Set-AzStorageBlobContent `
+            -Context $StorageContext `
+            -Container $ContainerName `
+            -File $tempFile `
+            -Blob $BlobName `
+            -Force `
+            -ErrorAction Stop | Out-Null
+    }
+    finally {
+        Remove-Item -Path $tempFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Try-Set-KeyVaultSecret {
+    param(
+        [Parameter(Mandatory = $true)][string]$VaultName,
+        [Parameter(Mandatory = $true)][string]$SecretName,
+        [Parameter(Mandatory = $true)][string]$SecretValue,
+        [hashtable]$Tags = @{}
+    )
+
+    try {
+        $secureValue = ConvertTo-SecureString -String $SecretValue -AsPlainText -Force
+
+        Invoke-WithRetry `
+            -ActionName "Set Key Vault secret $SecretName" `
+            -MaxAttempts 5 `
+            -DelaySeconds 20 `
+            -ScriptBlock {
+                Set-AzKeyVaultSecret `
+                    -VaultName $VaultName `
+                    -Name $SecretName `
+                    -SecretValue $secureValue `
+                    -ContentType 'training-decoy-secret' `
+                    -Tag $Tags `
+                    -ErrorAction Stop | Out-Null
+            }
+
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+try {
+    if (-not (Test-IsSkillableTokenOrBlank -Value $SubscriptionId)) {
+        Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
+    }
+
+    $azContext = Get-AzContext -ErrorAction Stop
+
+    if (Test-IsSkillableTokenOrBlank -Value $SubscriptionId) {
+        $SubscriptionId = $azContext.Subscription.Id
+    }
+
+    if (Test-IsSkillableTokenOrBlank -Value $TenantId) {
+        $TenantId = $azContext.Tenant.Id
+    }
+
+    $ResourceGroupName = Resolve-NSCSResourceGroup -RequestedResourceGroupName $ResourceGroupName
+
+    $safeAppName = ConvertTo-SafeName -Value $AppDisplayName
+
+    $storage = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -ErrorAction Stop |
+        Where-Object { $_.StorageAccountName -like 'stnscsdata*' } |
+        Select-Object -First 1
+
+    if (-not $storage) {
+        throw "No storage account matching 'stnscsdata*' was found in resource group '$ResourceGroupName'."
+    }
+
+    $keyVault = Get-AzKeyVault -ResourceGroupName $ResourceGroupName -ErrorAction Stop |
+        Where-Object { $_.VaultName -like 'kv-nscs-sec-*' } |
+        Select-Object -First 1
+
+    if (-not $keyVault) {
+        throw "No Key Vault matching 'kv-nscs-sec-*' was found in resource group '$ResourceGroupName'."
+    }
+
+    $nsg = Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroupName -ErrorAction Stop |
+        Where-Object { $_.Name -like 'nsg-nscs-web-*' } |
+        Select-Object -First 1
+
+    if (-not $nsg) {
+        throw "No NSG matching 'nsg-nscs-web-*' was found in resource group '$ResourceGroupName'."
+    }
+
+    $workspace = Get-AzOperationalInsightsWorkspace -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like 'law-nscs-secops-*' } |
+        Select-Object -First 1
+
+    $sqlServer = Get-AzResource `
+        -ResourceGroupName $ResourceGroupName `
+        -ResourceType 'Microsoft.Sql/servers' `
+        -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like 'sql-nscs-platform-*' } |
+        Select-Object -First 1
+
+    $sqlServerNameForEvidence = if ($sqlServer) { $sqlServer.Name } else { $null }
+    $sqlDatabaseNameForEvidence = $null
+
+    if ($sqlServerNameForEvidence) {
+        $sqlDatabase = Get-AzResource `
+            -ResourceGroupName $ResourceGroupName `
+            -ResourceType 'Microsoft.Sql/servers/databases' `
+            -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq "$sqlServerNameForEvidence/sqldb-customer-index" } |
+            Select-Object -First 1
+
+        if ($sqlDatabase) {
+            $sqlDatabaseNameForEvidence = (($sqlDatabase.Name -split '/')[-1])
+        }
+    }
+
+    $app = Get-AzADApplication -DisplayName $AppDisplayName -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -eq $AppDisplayName } |
+        Select-Object -First 1
+
+    if (-not $app) {
+        throw "App registration '$AppDisplayName' was not found. Run the service principal creation LCA first."
+    }
+
+    $sp = Get-AzADServicePrincipal -ApplicationId $app.AppId -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+
+    if (-not $sp) {
+        throw "Service principal for '$AppDisplayName' was not found. Run the service principal creation LCA first."
+    }
+
+    $storageContext = $storage.Context
+
+    foreach ($containerName in @('security-evidence', 'customer-exports', 'portal-content')) {
+        Ensure-Container -StorageContext $storageContext -Name $containerName
+    }
+
+    $timestampUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $fakeSourceIp = '198.51.100.42'
+    $suspiciousMgmtIp = '198.51.100.23/32'
+    $fakeSecretName = "$safeAppName-client-secret"
+    $caseId = 'NSCS-STOR-2026-051'
+
+    $summary = [ordered]@{
+        CompanyName = 'NorthSound Cumulus Services'
+        CaseId = $caseId
+        GeneratedUtc = $timestampUtc
+        TenantId = $TenantId
+        SubscriptionId = $SubscriptionId
+        ResourceGroupName = $ResourceGroupName
+        AppDisplayName = $AppDisplayName
+        SafeAppName = $safeAppName
+        ClientId = $app.AppId
+        ServicePrincipalObjectId = $sp.Id
+        KeyVaultName = $keyVault.VaultName
+        FakeSecretName = $fakeSecretName
+        SecretIsValidCredential = $false
+        StorageAccountName = $storage.StorageAccountName
+        NsgName = $nsg.Name
+        WorkspaceName = if ($workspace) { $workspace.Name } else { $null }
+        SqlServerName = $sqlServerNameForEvidence
+        SqlDatabaseName = $sqlDatabaseNameForEvidence
+        Scenario = 'Potential public cloud storage exposure reported by an external security researcher.'
+        ImportantNote = 'The Key Vault secret is intentionally fake and cannot be used for service principal authentication.'
+        PrimaryContacts = @{
+            CloudInfrastructureManager = 'Alex Moreno'
+            SecurityOperationsLead = 'Priya Shah'
+            SiteReliabilityEngineer = 'Jordan Nguyen'
+            ComplianceAndRiskOfficer = 'Maya Patel'
+        }
+    } | ConvertTo-Json -Depth 8
+
+    Set-TextBlob `
+        -StorageContext $storageContext `
+        -ContainerName 'security-evidence' `
+        -BlobName 'setup/nscs-evidence-summary.json' `
+        -Content $summary
+
+    Set-TextBlob `
+        -StorageContext $storageContext `
+        -ContainerName 'security-evidence' `
+        -BlobName 'logs/deployment-run.log' `
+        -Content @"
+2026-05-06T13:11:42Z INFO  Starting NorthSound Cumulus storage platform deployment workflow.
+2026-05-06T13:12:08Z INFO  Deployment identity selected: $AppDisplayName
+2026-05-06T13:12:11Z WARN  Client secret rotation check returned status: overdue.
+2026-05-06T13:12:20Z INFO  Validated customer data storage account: $($storage.StorageAccountName)
+2026-05-06T13:12:34Z INFO  Validated Key Vault: $($keyVault.VaultName)
+2026-05-06T13:12:49Z INFO  Validated platform metadata SQL server: $(if ($sqlServerNameForEvidence) { $sqlServerNameForEvidence } else { 'Not deployed' })
+2026-05-06T13:13:02Z WARN  Deployment identity has Contributor scope on resource group: $ResourceGroupName
+2026-05-06T13:13:44Z INFO  Deployment workflow completed.
+2026-05-06T13:21:10Z WARN  Unusual source IP observed during post-deployment activity: $fakeSourceIp
+2026-05-06T13:27:55Z WARN  Support access rule created on NSG: $($nsg.Name)
+"@
+
+    $identityEvents = @(
+        [ordered]@{
+            timestamp = '2026-05-06T13:22:09Z'
+            category = 'IdentityProtection'
+            identity = $AppDisplayName
+            clientId = $app.AppId
+            result = 'Failure'
+            reason = 'Invalid client secret'
+            sourceIp = $fakeSourceIp
+            resource = $keyVault.VaultName
+            severity = 'Medium'
+            trainingNote = 'Simulated evidence. The stored secret is intentionally not a valid Entra credential.'
+        },
+        [ordered]@{
+            timestamp = '2026-05-06T13:24:31Z'
+            category = 'StorageAccess'
+            identity = $AppDisplayName
+            clientId = $app.AppId
+            result = 'Success'
+            reason = 'Customer export container enumeration observed'
+            sourceIp = $fakeSourceIp
+            resource = $storage.StorageAccountName
+            severity = 'Medium'
+            trainingNote = 'Simulated investigation artifact.'
+        },
+        [ordered]@{
+            timestamp = '2026-05-06T13:29:04Z'
+            category = 'SecretAccess'
+            identity = $AppDisplayName
+            clientId = $app.AppId
+            result = 'Success'
+            reason = 'Secret metadata read'
+            sourceIp = $fakeSourceIp
+            resource = $keyVault.VaultName
+            severity = 'High'
+            trainingNote = 'Simulated investigation artifact.'
+        },
+        [ordered]@{
+            timestamp = '2026-05-06T13:37:44Z'
+            category = 'NetworkChange'
+            identity = $AppDisplayName
+            clientId = $app.AppId
+            result = 'Success'
+            reason = 'Inbound vendor support rule created'
+            sourceIp = $fakeSourceIp
+            resource = $nsg.Name
+            severity = 'High'
+            trainingNote = 'Backed by a real NSG rule created by this LCA.'
+        }
+    ) | ConvertTo-Json -Depth 8
+
+    Set-TextBlob `
+        -StorageContext $storageContext `
+        -ContainerName 'security-evidence' `
+        -BlobName 'logs/identity-risk-events.json' `
+        -Content $identityEvents
+
+    Set-TextBlob `
+        -StorageContext $storageContext `
+        -ContainerName 'security-evidence' `
+        -BlobName 'exports/role-assignments.csv' `
+        -Content @"
+principalName,principalType,role,scope,risk,expected
+$AppDisplayName,ServicePrincipal,Contributor,$ResourceGroupName,High,No
+$AppDisplayName,ServicePrincipal,Storage Blob Data Reader,$($storage.StorageAccountName),Medium,Partially
+$AppDisplayName,ServicePrincipal,Key Vault Secrets User,$($keyVault.VaultName),High,No
+mi-nscs-portal,ManagedIdentity,Reader,$ResourceGroupName,Low,Yes
+alex.moreno@northsound.example,User,Owner,$ResourceGroupName,Medium,Yes
+jordan.nguyen@northsound.example,User,Monitoring Contributor,$ResourceGroupName,Low,Yes
+"@
+
+    Set-TextBlob `
+        -StorageContext $storageContext `
+        -ContainerName 'security-evidence' `
+        -BlobName 'notes/storage-exposure-summary.txt' `
+        -Content @"
+NorthSound Cumulus Services Incident Notes
+
+Case ID: $caseId
+Reported issue: An external security researcher reported that a cloud storage resource might be accessible without authentication.
+
+A deployment identity named $AppDisplayName was observed with elevated access across the NorthSound Cumulus storage platform resource group.
+
+Known indicators:
+- App registration display name: $AppDisplayName
+- Client ID: $($app.AppId)
+- Service principal object ID: $($sp.Id)
+- Key Vault: $($keyVault.VaultName)
+- Storage account: $($storage.StorageAccountName)
+- SQL server: $(if ($sqlServerNameForEvidence) { $sqlServerNameForEvidence } else { 'Not deployed' })
+- SQL database: $(if ($sqlDatabaseNameForEvidence) { $sqlDatabaseNameForEvidence } else { 'Not deployed' })
+- Secret name: $fakeSecretName
+- Source IP observed in evidence: $fakeSourceIp
+- Support access NSG rule: AllowVendorSupportRDP
+
+Important:
+The stored Key Vault secret is a fake training artifact. It is intentionally not a valid Entra application credential.
+
+Initial concern:
+The identity appears to have more access than required for storage synchronization automation. Review role assignments, Key Vault secret exposure, storage containers, public access settings, and network rule changes.
+
+Contacts:
+- Alex Moreno, Cloud Infrastructure Manager
+- Priya Shah, Security Operations Lead
+- Jordan Nguyen, Site Reliability Engineer
+- Maya Patel, Compliance and Risk Officer
+"@
+
+    Set-TextBlob `
+        -StorageContext $storageContext `
+        -ContainerName 'security-evidence' `
+        -BlobName 'playbooks/storage-exposure-investigation-guide.md' `
+        -Content @"
+# NorthSound Cumulus Storage Exposure Investigation Guide
+
+## Investigation goals
+
+1. Identify the storage resources involved in the reported exposure.
+2. Review public access settings and container permissions.
+3. Identify risky service principals and role assignments.
+4. Determine whether the stored client secret is valid for authentication.
+5. Inspect Key Vault and storage evidence artifacts.
+6. Review NSG changes for unexpected vendor or management access.
+7. Recommend least-privilege and storage hardening remediation.
+
+## Important finding
+
+The secret named $fakeSecretName is a training artifact. It looks like a leaked client secret, but it is not a valid Entra application credential.
+
+## Evidence locations
+
+- Storage account: $($storage.StorageAccountName)
+- Evidence container: security-evidence
+- Customer export container: customer-exports
+- Portal content container: portal-content
+- Key Vault: $($keyVault.VaultName)
+- SQL server: $(if ($sqlServerNameForEvidence) { $sqlServerNameForEvidence } else { 'Not deployed' })
+- SQL database: $(if ($sqlDatabaseNameForEvidence) { $sqlDatabaseNameForEvidence } else { 'Not deployed' })
+- NSG: $($nsg.Name)
+- App registration: $AppDisplayName
+"@
+
+    Set-TextBlob `
+        -StorageContext $storageContext `
+        -ContainerName 'customer-exports' `
+        -BlobName 'exports/customer-upload-inventory.csv' `
+        -Content @"
+customerId,container,purpose,retentionDays,dataClassification,owner
+CUST-1042,customer-exports,monthly reporting export,90,customer-confidential,Platform Engineering
+CUST-1188,customer-exports,case document export,180,customer-confidential,Platform Engineering
+CUST-1260,customer-exports,audit log export,365,regulated-customer-data,Platform Engineering
+CUST-1427,customer-exports,backup validation sample,30,internal,Site Reliability Engineering
+"@
+
+    Set-TextBlob `
+        -StorageContext $storageContext `
+        -ContainerName 'customer-exports' `
+        -BlobName 'exports/q4-customer-retention-report.csv' `
+        -Content @"
+segment,activeCustomers,storageTb,renewalRisk,owner
+Healthcare,48,22.4,Medium,Maya Patel
+Fintech,36,18.1,High,Maya Patel
+Education,72,16.8,Low,Maya Patel
+Professional Services,91,13.7,Medium,Maya Patel
+"@
+
+    Set-TextBlob `
+        -StorageContext $storageContext `
+        -ContainerName 'customer-exports' `
+        -BlobName 'ops/storage-platform-overview.md' `
+        -Content @"
+# NorthSound Cumulus Storage Platform Overview
+
+NorthSound Cumulus Services stores customer-generated documents, exports, system logs, and backup data in Azure Storage.
+
+Deployment automation uses the $AppDisplayName service principal.
+
+The service principal was originally created for storage synchronization and export workflow tasks. It should only have the minimum permissions required to read specific export containers and retrieve required configuration references.
+"@
+
+    Set-TextBlob `
+        -StorageContext $storageContext `
+        -ContainerName 'customer-exports' `
+        -BlobName 'contracts/customer-data-retention-summary.txt' `
+        -Content @"
+Customer Data Retention Summary
+
+NorthSound Cumulus Services supports contractual retention periods across healthcare, fintech, education, and professional services customers.
+
+Data owner: Platform Engineering
+Compliance reviewer: Maya Patel
+Security reviewer: Priya Shah
+Review date: 2026-05-15
+Status: Pending access review
+"@
+
+    Set-TextBlob `
+        -StorageContext $storageContext `
+        -ContainerName 'portal-content' `
+        -BlobName 'index.html' `
+        -Content @"
+<!doctype html>
+<html>
+<head>
+  <title>NorthSound Cumulus Portal</title>
+</head>
+<body>
+  <h1>NorthSound Cumulus Portal</h1>
+  <p>Customer data management dashboard.</p>
+  <script src="./assets/app.js"></script>
+</body>
+</html>
+"@
+
+    Set-TextBlob `
+        -StorageContext $storageContext `
+        -ContainerName 'portal-content' `
+        -BlobName 'assets/app.js' `
+        -Content @"
+const appConfigPath = '/config/appsettings.json';
+
+async function loadConfig() {
+  const response = await fetch(appConfigPath);
+  return await response.json();
+}
+
+loadConfig().then(config => {
+  console.log('NorthSound Cumulus portal config loaded.');
+});
+"@
+
+    Set-TextBlob `
+        -StorageContext $storageContext `
+        -ContainerName 'portal-content' `
+        -BlobName 'config/appsettings.json' `
+        -Content @"
+{
+  "applicationName": "NorthSound Cumulus Portal",
+  "environment": "training",
+  "keyVaultName": "$($keyVault.VaultName)",
+  "deploymentIdentity": "$AppDisplayName",
+  "notes": "Secrets are retrieved by deployment automation. Do not place plaintext credentials in portal content."
+}
+"@
+
+    $decoySecretResults = @()
+
+    $secretMap = [ordered]@{
+        'sql-reporting-admin-password' = 'P@ssw0rd-Training-Only-61572827!'
+        'customer-export-backup-sas' = 'sv=2024-11-04&ss=b&srt=sco&sp=rl&se=2026-06-01T00:00:00Z&sig=trainingOnlyDoNotUse'
+        'github-deploy-token' = 'ghp_trainingOnly_61572827_fakeTokenValue'
+        'legacy-telemetry-connection-string' = 'InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=https://eastus-0.in.applicationinsights.azure.com/'
+        'legacy-ingest-api-key' = 'legacy_training_key_61572827'
+        'support-vpn-shared-key' = 'training-vpn-shared-key-rotate-me'
+    }
+
+    foreach ($secretName in $secretMap.Keys) {
+        $created = Try-Set-KeyVaultSecret `
+            -VaultName $keyVault.VaultName `
+            -SecretName $secretName `
+            -SecretValue $secretMap[$secretName] `
+            -Tags @{
+                owner = 'Platform Engineering'
+                company = 'NorthSound Cumulus Services'
+                labPurpose = 'investigation-noise'
+                trainingOnly = 'true'
+            }
+
+        $decoySecretResults += [ordered]@{
+            secretName = $secretName
+            vaultName = $keyVault.VaultName
+            createdInKeyVault = $created
+            trainingOnly = $true
+        }
+    }
+
+    Set-TextBlob `
+        -StorageContext $storageContext `
+        -ContainerName 'security-evidence' `
+        -BlobName 'setup/decoy-secret-seeding-results.json' `
+        -Content ($decoySecretResults | ConvertTo-Json -Depth 8)
+
+    $existingRule = $nsg.SecurityRules |
+        Where-Object { $_.Name -eq 'AllowVendorSupportRDP' } |
+        Select-Object -First 1
+
+    if (-not $existingRule) {
+        $nsg | Add-AzNetworkSecurityRuleConfig `
+            -Name 'AllowVendorSupportRDP' `
+            -Description 'Vendor support access opened during storage exposure review. Validate change approval and source address.' `
+            -Access Allow `
+            -Protocol Tcp `
+            -Direction Inbound `
+            -Priority 110 `
+            -SourceAddressPrefix $suspiciousMgmtIp `
+            -SourcePortRange '*' `
+            -DestinationAddressPrefix '*' `
+            -DestinationPortRange 3389 `
+            -ErrorAction Stop | Out-Null
+
+        $nsg | Set-AzNetworkSecurityGroup -ErrorAction Stop | Out-Null
+    }
+
+    $rg = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop
+    $tags = @{}
+
+    if ($rg.Tags) {
+        foreach ($key in $rg.Tags.Keys) {
+            $tags[$key] = $rg.Tags[$key]
+        }
+    }
+
+    $tags['BusinessUnit'] = 'PlatformEngineering'
+    $tags['DataClassification'] = 'CustomerData'
+    $tags['AccessReviewStatus'] = 'Overdue'
+    $tags['SecurityReview'] = 'Required'
+    $tags['IncidentCase'] = $caseId
+    $tags['EvidenceSeededUtc'] = $timestampUtc
+
+    Set-AzResourceGroup -Name $ResourceGroupName -Tag $tags -ErrorAction Stop | Out-Null
+
+    $storageTags = @{}
+    if ($storage.Tags) {
+        foreach ($key in $storage.Tags.Keys) {
+            $storageTags[$key] = $storage.Tags[$key]
+        }
+    }
+
+    $storageTags['DataClassification'] = 'CustomerData'
+    $storageTags['RetentionPolicy'] = 'CustomerContract'
+    $storageTags['LastAccessReview'] = 'Overdue'
+    $storageTags['PublicExposureRisk'] = 'NeedsReview'
+
+    Set-AzResource `
+        -ResourceId $storage.Id `
+        -Tag $storageTags `
+        -Force `
+        -ErrorAction Stop | Out-Null
+
+    $kvResource = Get-AzResource -ResourceId $keyVault.ResourceId -ErrorAction Stop
+    $kvTags = @{}
+
+    if ($kvResource.Tags) {
+        foreach ($key in $kvResource.Tags.Keys) {
+            $kvTags[$key] = $kvResource.Tags[$key]
+        }
+    }
+
+    $kvTags['SecretRotation'] = 'Overdue'
+    $kvTags['PrivilegedIdentityLinked'] = $safeAppName
+    $kvTags['Owner'] = 'PlatformEngineering'
+    $kvTags['IncidentCase'] = $caseId
+
+    Set-AzResource `
+        -ResourceId $keyVault.ResourceId `
+        -Tag $kvTags `
+        -Force `
+        -ErrorAction Stop | Out-Null
+
+    Set-TextBlob `
+        -StorageContext $storageContext `
+        -ContainerName 'security-evidence' `
+        -BlobName 'setup/evidence-seeding-complete.txt' `
+        -Content "NorthSound Cumulus evidence seeding completed at $timestampUtc."
+
+    exit 0
+}
+catch {
+    throw
+}
