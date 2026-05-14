@@ -1,0 +1,582 @@
+param(
+    [string]$SubscriptionId = '@lab.CloudSubscription.Id',
+    [string]$ResourceGroupName = '@lab.CloudResourceGroup(NS-RG1).Name',
+    [string]$TenantId = '@lab.CloudTenant.Id',
+    [string]$AppDisplayName = 'svc-nscs-storage-sync-@lab.LabInstance.Id',
+    [string]$ArtifactContainerName = 'security-evidence'
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$WarningPreference = 'SilentlyContinue'
+$InformationPreference = 'SilentlyContinue'
+$VerbosePreference = 'SilentlyContinue'
+$DebugPreference = 'SilentlyContinue'
+
+$safeAppName = $AppDisplayName.ToLowerInvariant() -replace '[^a-z0-9-]', '-'
+$safeAppName = $safeAppName -replace '-+', '-'
+$safeAppName = $safeAppName.Trim('-')
+
+if ([string]::IsNullOrWhiteSpace($safeAppName)) {
+    $safeAppName = 'svc-nscs-storage-sync'
+}
+
+$secretName = "$safeAppName-client-secret"
+$contextFileName = "$safeAppName.json"
+$contextBlobName = "setup/$contextFileName"
+
+function Test-IsSkillableTokenOrBlank {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+    if ($Value.Trim().StartsWith('@lab.')) { return $true }
+
+    return $false
+}
+
+function Invoke-WithRetry {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock,
+        [int]$MaxAttempts = 8,
+        [int]$DelaySeconds = 15,
+        [switch]$AllowFailure,
+        [string]$ActionName = 'operation'
+    )
+
+    $lastError = $null
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            return & $ScriptBlock
+        }
+        catch {
+            $lastError = $_.Exception.Message
+
+            if ($attempt -lt $MaxAttempts) {
+                Start-Sleep -Seconds $DelaySeconds
+            }
+        }
+    }
+
+    if ($AllowFailure) {
+        return $null
+    }
+
+    throw "$ActionName failed after $MaxAttempts attempts. Last error: $lastError"
+}
+
+function Get-NSCSWorkRoot {
+    $root = Join-Path ([System.IO.Path]::GetTempPath()) 'NorthSoundCumulus'
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+
+    return $root
+}
+
+function Initialize-LabContext {
+    param(
+        [string]$SubscriptionId,
+        [string]$ResourceGroupName,
+        [string]$TenantId
+    )
+
+    $context = Get-AzContext -ErrorAction SilentlyContinue
+
+    if (-not $context) {
+        throw 'No Azure context found.'
+    }
+
+    if (Test-IsSkillableTokenOrBlank -Value $SubscriptionId) {
+        $SubscriptionId = $context.Subscription.Id
+    }
+
+    Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
+    $context = Get-AzContext -ErrorAction Stop
+
+    if (Test-IsSkillableTokenOrBlank -Value $TenantId) {
+        $TenantId = $context.Tenant.Id
+    }
+
+    if (Test-IsSkillableTokenOrBlank -Value $ResourceGroupName) {
+        $ResourceGroupName = Invoke-WithRetry `
+            -ActionName 'Discover NorthSound Cumulus resource group' `
+            -MaxAttempts 12 `
+            -DelaySeconds 15 `
+            -ScriptBlock {
+                $candidateStorage = Get-AzStorageAccount -ErrorAction SilentlyContinue |
+                    Where-Object { $_.StorageAccountName -like 'stnscsdata*' } |
+                    Select-Object -First 1
+
+                if ($candidateStorage) {
+                    return $candidateStorage.ResourceGroupName
+                }
+
+                $candidateKeyVault = Get-AzResource `
+                    -ResourceType 'Microsoft.KeyVault/vaults' `
+                    -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -like 'kv-nscs-sec-*' } |
+                    Select-Object -First 1
+
+                if ($candidateKeyVault) {
+                    return $candidateKeyVault.ResourceGroupName
+                }
+
+                throw 'Could not discover the NorthSound Cumulus resource group.'
+            }
+    }
+
+    [pscustomobject]@{
+        SubscriptionId    = $SubscriptionId
+        ResourceGroupName = $ResourceGroupName
+        TenantId          = $TenantId
+    }
+}
+
+function Get-NSCSResources {
+    param([Parameter(Mandatory = $true)][string]$ResourceGroupName)
+
+    $storage = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -ErrorAction Stop |
+        Where-Object { $_.StorageAccountName -like 'stnscsdata*' } |
+        Select-Object -First 1
+
+    $keyVault = Get-AzKeyVault -ResourceGroupName $ResourceGroupName -ErrorAction Stop |
+        Where-Object { $_.VaultName -like 'kv-nscs-sec-*' } |
+        Select-Object -First 1
+
+    $nsg = Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroupName -ErrorAction Stop |
+        Where-Object { $_.Name -like 'nsg-nscs-web-*' } |
+        Select-Object -First 1
+
+    if (-not $storage) { throw "NorthSound storage account not found in resource group '$ResourceGroupName'." }
+    if (-not $keyVault) { throw "NorthSound Key Vault not found in resource group '$ResourceGroupName'." }
+    if (-not $nsg) { throw "NorthSound NSG not found in resource group '$ResourceGroupName'." }
+
+    $keyVaultId = $keyVault.ResourceId
+    if ([string]::IsNullOrWhiteSpace($keyVaultId)) {
+        $keyVaultId = $keyVault.Id
+    }
+
+    [pscustomobject]@{
+        StorageAccountName = $storage.StorageAccountName
+        StorageAccountId   = $storage.Id
+        KeyVaultName       = $keyVault.VaultName
+        KeyVaultId         = $keyVaultId
+        NsgName            = $nsg.Name
+        NsgId              = $nsg.Id
+    }
+}
+
+function Resolve-CurrentAccountIdentity {
+    $ctx = Get-AzContext -ErrorAction Stop
+    $accountId = $ctx.Account.Id
+    $accountType = "$($ctx.Account.Type)"
+
+    $identity = [ordered]@{
+        AccountId   = $accountId
+        AccountType = $accountType
+        ObjectId    = $null
+        SignInName  = $null
+    }
+
+    if ($accountType -eq 'User') {
+        $identity.SignInName = $accountId
+
+        try {
+            $user = Get-AzADUser -UserPrincipalName $accountId -ErrorAction Stop | Select-Object -First 1
+            if ($user) {
+                $identity.ObjectId = $user.Id
+            }
+        }
+        catch {}
+    }
+    elseif ($accountType -eq 'ServicePrincipal') {
+        try {
+            $setupSp = Get-AzADServicePrincipal -ApplicationId $accountId -ErrorAction Stop | Select-Object -First 1
+            if ($setupSp) {
+                $identity.ObjectId = $setupSp.Id
+            }
+        }
+        catch {}
+
+        if ([string]::IsNullOrWhiteSpace($identity.ObjectId)) {
+            try {
+                $setupSp = Get-AzADServicePrincipal -ObjectId $accountId -ErrorAction Stop | Select-Object -First 1
+                if ($setupSp) {
+                    $identity.ObjectId = $setupSp.Id
+                }
+            }
+            catch {}
+        }
+    }
+
+    [pscustomobject]$identity
+}
+
+function Ensure-RoleAssignment {
+    param(
+        [string]$ObjectId,
+        [string]$SignInName,
+        [Parameter(Mandatory = $true)][string]$RoleDefinitionName,
+        [Parameter(Mandatory = $true)][string]$Scope,
+        [int]$MaxAttempts = 8,
+        [int]$DelaySeconds = 15,
+        [switch]$AllowFailure
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ObjectId) -and [string]::IsNullOrWhiteSpace($SignInName)) {
+        throw "Cannot assign role '$RoleDefinitionName' because neither ObjectId nor SignInName was supplied."
+    }
+
+    Invoke-WithRetry `
+        -ActionName "Ensure role '$RoleDefinitionName'" `
+        -MaxAttempts $MaxAttempts `
+        -DelaySeconds $DelaySeconds `
+        -AllowFailure:$AllowFailure `
+        -ScriptBlock {
+            $existing = $null
+
+            if (-not [string]::IsNullOrWhiteSpace($ObjectId)) {
+                $existing = Get-AzRoleAssignment `
+                    -ObjectId $ObjectId `
+                    -RoleDefinitionName $RoleDefinitionName `
+                    -Scope $Scope `
+                    -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($SignInName)) {
+                $existing = Get-AzRoleAssignment `
+                    -SignInName $SignInName `
+                    -RoleDefinitionName $RoleDefinitionName `
+                    -Scope $Scope `
+                    -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+            }
+
+            if ($existing) {
+                return $existing
+            }
+
+            try {
+                if (-not [string]::IsNullOrWhiteSpace($ObjectId)) {
+                    New-AzRoleAssignment `
+                        -ObjectId $ObjectId `
+                        -RoleDefinitionName $RoleDefinitionName `
+                        -Scope $Scope `
+                        -ErrorAction Stop | Out-Null
+                }
+                else {
+                    New-AzRoleAssignment `
+                        -SignInName $SignInName `
+                        -RoleDefinitionName $RoleDefinitionName `
+                        -Scope $Scope `
+                        -ErrorAction Stop | Out-Null
+                }
+            }
+            catch {
+                if ($_.Exception.Message -match '(?i)already exists|role assignment already exists|conflict') {
+                    return $null
+                }
+
+                throw
+            }
+        } | Out-Null
+}
+
+function Grant-CurrentPrincipalKeyVaultSecretAccess {
+    param(
+        [Parameter(Mandatory = $true)][string]$VaultName,
+        [Parameter(Mandatory = $true)][string]$VaultId
+    )
+
+    $vault = Get-AzKeyVault -VaultName $VaultName -ErrorAction Stop
+    $identity = Resolve-CurrentAccountIdentity
+
+    if ($vault.EnableRbacAuthorization) {
+        if (-not [string]::IsNullOrWhiteSpace($identity.ObjectId)) {
+            Ensure-RoleAssignment `
+                -ObjectId $identity.ObjectId `
+                -RoleDefinitionName 'Key Vault Secrets Officer' `
+                -Scope $VaultId `
+                -MaxAttempts 8 `
+                -DelaySeconds 20 `
+                -AllowFailure
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($identity.SignInName)) {
+            Ensure-RoleAssignment `
+                -SignInName $identity.SignInName `
+                -RoleDefinitionName 'Key Vault Secrets Officer' `
+                -Scope $VaultId `
+                -MaxAttempts 8 `
+                -DelaySeconds 20 `
+                -AllowFailure
+        }
+    }
+    else {
+        Invoke-WithRetry `
+            -ActionName 'Set Key Vault access policy for setup identity' `
+            -MaxAttempts 8 `
+            -DelaySeconds 20 `
+            -AllowFailure `
+            -ScriptBlock {
+                if (-not [string]::IsNullOrWhiteSpace($identity.ObjectId)) {
+                    Set-AzKeyVaultAccessPolicy `
+                        -VaultName $VaultName `
+                        -ObjectId $identity.ObjectId `
+                        -PermissionsToSecrets get,list,set,delete,recover,backup,restore `
+                        -ErrorAction Stop | Out-Null
+
+                    return
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace($identity.SignInName)) {
+                    Set-AzKeyVaultAccessPolicy `
+                        -VaultName $VaultName `
+                        -UserPrincipalName $identity.SignInName `
+                        -PermissionsToSecrets get,list,set,delete,recover,backup,restore `
+                        -ErrorAction Stop | Out-Null
+
+                    return
+                }
+
+                throw 'Could not resolve setup identity for Key Vault access policy.'
+            } | Out-Null
+
+        Start-Sleep -Seconds 60
+    }
+}
+
+function Get-OrCreate-NSCSApp {
+    param([Parameter(Mandatory = $true)][string]$AppDisplayName)
+
+    $app = Get-AzADApplication -DisplayName $AppDisplayName -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -eq $AppDisplayName } |
+        Select-Object -First 1
+
+    if ($app) {
+        return $app
+    }
+
+    $app = New-AzADApplication -DisplayName $AppDisplayName -ErrorAction Stop
+
+    if (-not $app -or [string]::IsNullOrWhiteSpace($app.AppId)) {
+        throw "Failed to create or resolve app registration '$AppDisplayName'."
+    }
+
+    return $app
+}
+
+function Get-OrCreate-NSCSServicePrincipal {
+    param([Parameter(Mandatory = $true)][string]$AppId)
+
+    Invoke-WithRetry `
+        -ActionName "Get or create service principal for appId $AppId" `
+        -MaxAttempts 10 `
+        -DelaySeconds 20 `
+        -ScriptBlock {
+            $sp = Get-AzADServicePrincipal -ApplicationId $AppId -ErrorAction SilentlyContinue | Select-Object -First 1
+
+            if ($sp) {
+                return $sp
+            }
+
+            $sp = New-AzADServicePrincipal -ApplicationId $AppId -ErrorAction Stop
+
+            if (-not $sp -or [string]::IsNullOrWhiteSpace($sp.Id)) {
+                throw "Failed to create or resolve service principal for appId '$AppId'."
+            }
+
+            return $sp
+        }
+}
+
+function Ensure-ArtifactContainer {
+    param(
+        [Parameter(Mandatory = $true)]$StorageContext,
+        [Parameter(Mandatory = $true)][string]$ContainerName
+    )
+
+    $container = Get-AzStorageContainer `
+        -Name $ContainerName `
+        -Context $StorageContext `
+        -ErrorAction SilentlyContinue
+
+    if ($container) {
+        return
+    }
+
+    New-AzStorageContainer `
+        -Name $ContainerName `
+        -Context $StorageContext `
+        -Permission Off `
+        -ErrorAction Stop | Out-Null
+}
+
+try {
+    $lab = Initialize-LabContext `
+        -SubscriptionId $SubscriptionId `
+        -ResourceGroupName $ResourceGroupName `
+        -TenantId $TenantId
+
+    $SubscriptionId = $lab.SubscriptionId
+    $ResourceGroupName = $lab.ResourceGroupName
+    $TenantId = $lab.TenantId
+
+    $resources = Invoke-WithRetry `
+        -ActionName 'Discover NorthSound Cumulus resources' `
+        -MaxAttempts 12 `
+        -DelaySeconds 15 `
+        -ScriptBlock {
+            Get-NSCSResources -ResourceGroupName $ResourceGroupName
+        }
+
+    $resourceGroup = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop
+    $resourceGroupId = $resourceGroup.ResourceId
+
+    $app = Get-OrCreate-NSCSApp -AppDisplayName $AppDisplayName
+    $appId = $app.AppId
+
+    $sp = Get-OrCreate-NSCSServicePrincipal -AppId $appId
+
+    $clientSecret = "fake-secret-$safeAppName-$([guid]::NewGuid().ToString('N'))"
+
+    Grant-CurrentPrincipalKeyVaultSecretAccess `
+        -VaultName $resources.KeyVaultName `
+        -VaultId $resources.KeyVaultId
+
+    $secureSecret = ConvertTo-SecureString `
+        -String $clientSecret `
+        -AsPlainText `
+        -Force
+
+    Invoke-WithRetry `
+        -ActionName "Store $AppDisplayName training secret in Key Vault" `
+        -MaxAttempts 12 `
+        -DelaySeconds 20 `
+        -ScriptBlock {
+            Set-AzKeyVaultSecret `
+                -VaultName $resources.KeyVaultName `
+                -Name $secretName `
+                -SecretValue $secureSecret `
+                -ContentType 'training-secret-not-valid-for-authentication' `
+                -Tag @{
+                    owner              = 'Platform Engineering'
+                    company            = 'NorthSound Cumulus Services'
+                    rotation           = 'overdue'
+                    labPurpose         = 'storage-exposure-investigation'
+                    appName            = $AppDisplayName
+                    trainingOnly       = 'true'
+                    authValid          = 'false'
+                    serviceDescription = 'Customer storage synchronization automation'
+                } `
+                -ErrorAction Stop | Out-Null
+        } | Out-Null
+
+    $secret = Get-AzKeyVaultSecret `
+        -VaultName $resources.KeyVaultName `
+        -Name $secretName `
+        -ErrorAction Stop
+
+    $secretUri = $secret.Id
+
+    Ensure-RoleAssignment `
+        -ObjectId $sp.Id `
+        -RoleDefinitionName 'Contributor' `
+        -Scope $resourceGroupId `
+        -MaxAttempts 10 `
+        -DelaySeconds 20
+
+    Ensure-RoleAssignment `
+        -ObjectId $sp.Id `
+        -RoleDefinitionName 'Storage Blob Data Reader' `
+        -Scope $resources.StorageAccountId `
+        -MaxAttempts 10 `
+        -DelaySeconds 20
+
+    Ensure-RoleAssignment `
+        -ObjectId $sp.Id `
+        -RoleDefinitionName 'Key Vault Secrets User' `
+        -Scope $resources.KeyVaultId `
+        -MaxAttempts 10 `
+        -DelaySeconds 20
+
+    $keyVaultAuthorization = Get-AzKeyVault `
+        -VaultName $resources.KeyVaultName `
+        -ErrorAction Stop
+
+    if (-not $keyVaultAuthorization.EnableRbacAuthorization) {
+        Invoke-WithRetry `
+            -ActionName "Grant Key Vault access policy to $AppDisplayName" `
+            -MaxAttempts 8 `
+            -DelaySeconds 20 `
+            -ScriptBlock {
+                Set-AzKeyVaultAccessPolicy `
+                    -VaultName $resources.KeyVaultName `
+                    -ObjectId $sp.Id `
+                    -PermissionsToSecrets get,list `
+                    -ErrorAction Stop | Out-Null
+            } | Out-Null
+
+        Start-Sleep -Seconds 60
+    }
+
+    $workRoot = Get-NSCSWorkRoot
+    $contextPath = Join-Path $workRoot $contextFileName
+
+    [ordered]@{
+        CompanyName              = 'NorthSound Cumulus Services'
+        Scenario                 = 'Potential cloud storage exposure investigation'
+        TenantId                 = $TenantId
+        SubscriptionId           = $SubscriptionId
+        ResourceGroupName        = $ResourceGroupName
+        AppDisplayName           = $AppDisplayName
+        SafeAppName              = $safeAppName
+        ClientId                 = $appId
+        ServicePrincipalObjectId = $sp.Id
+        KeyVaultName             = $resources.KeyVaultName
+        KeyVaultId               = $resources.KeyVaultId
+        SecretName               = $secretName
+        SecretUri                = $secretUri
+        SecretIsValidCredential  = $false
+        StorageAccountName       = $resources.StorageAccountName
+        StorageAccountId         = $resources.StorageAccountId
+        NsgName                  = $resources.NsgName
+        ContextBlobName          = $contextBlobName
+    } |
+        ConvertTo-Json -Depth 6 |
+        Set-Content -Path $contextPath -Encoding UTF8
+
+    $storageAccount = Get-AzStorageAccount `
+        -ResourceGroupName $ResourceGroupName `
+        -Name $resources.StorageAccountName `
+        -ErrorAction Stop
+
+    $storageContext = $storageAccount.Context
+
+    Invoke-WithRetry `
+        -ActionName "Ensure storage container '$ArtifactContainerName'" `
+        -MaxAttempts 8 `
+        -DelaySeconds 15 `
+        -ScriptBlock {
+            Ensure-ArtifactContainer `
+                -StorageContext $storageContext `
+                -ContainerName $ArtifactContainerName
+        } | Out-Null
+
+    Invoke-WithRetry `
+        -ActionName "Upload $AppDisplayName context artifact" `
+        -MaxAttempts 8 `
+        -DelaySeconds 15 `
+        -ScriptBlock {
+            Set-AzStorageBlobContent `
+                -Context $storageContext `
+                -Container $ArtifactContainerName `
+                -File $contextPath `
+                -Blob $contextBlobName `
+                -Force `
+                -ErrorAction Stop | Out-Null
+        } | Out-Null
+
+    return $true
+}
+catch {
+    throw $_.Exception.Message
+}
