@@ -631,6 +631,27 @@ loadConfig().then(config => {
         $nsg | Set-AzNetworkSecurityGroup -ErrorAction Stop | Out-Null
     }
 
+$existingDiagnosticsRule = $nsg.SecurityRules |
+    Where-Object { $_.Name -eq 'AllowVendorPortalDiagnostics' } |
+    Select-Object -First 1
+
+    if (-not $existingDiagnosticsRule) {
+        $nsg | Add-AzNetworkSecurityRuleConfig `
+            -Name 'AllowVendorPortalDiagnostics' `
+            -Description 'Temporary vendor diagnostics access for the customer portal. Validate change approval and business justification.' `
+            -Access Allow `
+            -Protocol Tcp `
+            -Direction Inbound `
+            -Priority 115 `
+            -SourceAddressPrefix $suspiciousMgmtIp `
+            -SourcePortRange '*' `
+            -DestinationAddressPrefix '*' `
+            -DestinationPortRange 8443 `
+            -ErrorAction Stop | Out-Null
+    
+        $nsg | Set-AzNetworkSecurityGroup -ErrorAction Stop | Out-Null
+    }
+
     $rg = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction Stop
     $tags = @{}
 
