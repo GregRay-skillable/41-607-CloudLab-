@@ -631,9 +631,9 @@ loadConfig().then(config => {
         $nsg | Set-AzNetworkSecurityGroup -ErrorAction Stop | Out-Null
     }
 
-$existingDiagnosticsRule = $nsg.SecurityRules |
-    Where-Object { $_.Name -eq 'AllowVendorPortalDiagnostics' } |
-    Select-Object -First 1
+    $existingDiagnosticsRule = $nsg.SecurityRules |
+        Where-Object { $_.Name -eq 'AllowVendorPortalDiagnostics' } |
+        Select-Object -First 1
 
     if (-not $existingDiagnosticsRule) {
         $nsg | Add-AzNetworkSecurityRuleConfig `
@@ -648,7 +648,7 @@ $existingDiagnosticsRule = $nsg.SecurityRules |
             -DestinationAddressPrefix '*' `
             -DestinationPortRange 8443 `
             -ErrorAction Stop | Out-Null
-    
+
         $nsg | Set-AzNetworkSecurityGroup -ErrorAction Stop | Out-Null
     }
 
