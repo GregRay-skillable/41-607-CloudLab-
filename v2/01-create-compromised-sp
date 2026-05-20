@@ -23,7 +23,7 @@ if ([string]::IsNullOrWhiteSpace($safeAppName)) {
 
 $secretName = "$safeAppName-client-secret"
 $contextFileName = "$safeAppName.json"
-$contextBlobName = "setup/$contextFileName"
+$contextBlobName = "Governance/workload-identity-review.json"
 
 function Test-IsSkillableTokenOrBlank {
     param([string]$Value)
