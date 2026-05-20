@@ -308,7 +308,7 @@ try {
     Set-TextBlob `
         -StorageContext $storageContext `
         -ContainerName 'security-evidence' `
-        -BlobName 'setup/nscs-evidence-summary.json' `
+        -BlobName 'Governance/incident-case-summary.json' `
         -Content $summary
 
     Set-TextBlob `
@@ -607,7 +607,7 @@ loadConfig().then(config => {
     Set-TextBlob `
         -StorageContext $storageContext `
         -ContainerName 'security-evidence' `
-        -BlobName 'setup/decoy-secret-seeding-results.json' `
+        -BlobName 'Governance/credential-review-results.json' `
         -Content ($decoySecretResults | ConvertTo-Json -Depth 8)
 
     $existingRule = $nsg.SecurityRules |
@@ -690,7 +690,7 @@ loadConfig().then(config => {
     Set-TextBlob `
         -StorageContext $storageContext `
         -ContainerName 'security-evidence' `
-        -BlobName 'setup/evidence-seeding-complete.txt' `
+        -BlobName 'Governance/access-review-completion-record.txt' `
         -Content "NorthSound Cumulus evidence seeding completed at $timestampUtc."
 
     exit 0
