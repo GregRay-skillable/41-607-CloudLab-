@@ -1,3 +1,4 @@
+# this is run via the seed nscs evidence LCA
 param(
     [Parameter(Mandatory = $true)]
     [string]$SubscriptionId,
@@ -271,6 +272,7 @@ try {
     }
 
     $timestampUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $todayDateStamp = $timestampUtc.Substring(0, 10)
     $fakeSourceIp = '198.51.100.42'
     $suspiciousMgmtIp = '198.51.100.23/32'
     $fakeSecretName = "$safeAppName-client-secret"
@@ -316,21 +318,21 @@ try {
         -ContainerName 'security-evidence' `
         -BlobName 'logs/deployment-run.log' `
         -Content @"
-2026-05-06T13:11:42Z INFO  Starting NorthSound Cumulus storage platform deployment workflow.
-2026-05-06T13:12:08Z INFO  Deployment identity selected: $AppDisplayName
-2026-05-06T13:12:11Z WARN  Client secret rotation check returned status: overdue.
-2026-05-06T13:12:20Z INFO  Validated customer data storage account: $($storage.StorageAccountName)
-2026-05-06T13:12:34Z INFO  Validated Key Vault: $($keyVault.VaultName)
-2026-05-06T13:12:49Z INFO  Validated platform metadata SQL server: $(if ($sqlServerNameForEvidence) { $sqlServerNameForEvidence } else { 'Not deployed' })
-2026-05-06T13:13:02Z WARN  Deployment identity has Contributor scope on resource group: $ResourceGroupName
-2026-05-06T13:13:44Z INFO  Deployment workflow completed.
-2026-05-06T13:21:10Z WARN  Unusual source IP observed during post-deployment activity: $fakeSourceIp
-2026-05-06T13:27:55Z WARN  Support access rule created on NSG: $($nsg.Name)
+${todayDateStamp}T13:11:42Z INFO  Starting NorthSound Cumulus storage platform deployment workflow.
+${todayDateStamp}T13:12:08Z INFO  Deployment identity selected: $AppDisplayName
+${todayDateStamp}T13:12:11Z WARN  Client secret rotation check returned status: overdue.
+${todayDateStamp}T13:12:20Z INFO  Validated customer data storage account: $($storage.StorageAccountName)
+${todayDateStamp}T13:12:34Z INFO  Validated Key Vault: $($keyVault.VaultName)
+${todayDateStamp}T13:12:49Z INFO  Validated platform metadata SQL server: $(if ($sqlServerNameForEvidence) { $sqlServerNameForEvidence } else { 'Not deployed' })
+${todayDateStamp}T13:13:02Z WARN  Deployment identity has Contributor scope on resource group: $ResourceGroupName
+${todayDateStamp}T13:13:44Z INFO  Deployment workflow completed.
+${todayDateStamp}T13:21:10Z WARN  Unusual source IP observed during post-deployment activity: $fakeSourceIp
+${todayDateStamp}T13:27:55Z WARN  Support access rule created on NSG: $($nsg.Name)
 "@
 
     $identityEvents = @(
         [ordered]@{
-            timestamp = '2026-05-06T13:22:09Z'
+            timestamp = "${todayDateStamp}T13:22:09Z"
             category = 'IdentityProtection'
             identity = $AppDisplayName
             clientId = $app.AppId
@@ -342,7 +344,7 @@ try {
             trainingNote = 'Simulated evidence. The stored secret is intentionally not a valid Entra credential.'
         },
         [ordered]@{
-            timestamp = '2026-05-06T13:24:31Z'
+            timestamp = "${todayDateStamp}T13:24:31Z"
             category = 'StorageAccess'
             identity = $AppDisplayName
             clientId = $app.AppId
@@ -354,7 +356,7 @@ try {
             trainingNote = 'Simulated investigation artifact.'
         },
         [ordered]@{
-            timestamp = '2026-05-06T13:29:04Z'
+            timestamp = "${todayDateStamp}T13:29:04Z"
             category = 'SecretAccess'
             identity = $AppDisplayName
             clientId = $app.AppId
@@ -366,7 +368,7 @@ try {
             trainingNote = 'Simulated investigation artifact.'
         },
         [ordered]@{
-            timestamp = '2026-05-06T13:37:44Z'
+            timestamp = "${todayDateStamp}T13:37:44Z"
             category = 'NetworkChange'
             identity = $AppDisplayName
             clientId = $app.AppId
@@ -520,7 +522,7 @@ NorthSound Cumulus Services supports contractual retention periods across health
 Data owner: Platform Engineering
 Compliance reviewer: Maya Patel
 Security reviewer: Priya Shah
-Review date: 2026-05-15
+Review date: ${todayDateStamp}
 Status: Pending access review
 "@
 
