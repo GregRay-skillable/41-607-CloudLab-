@@ -1,0 +1,74 @@
+# NSCS full security-review coverage package
+
+Use these files to fully cover the security comments around lab value handling, role assignment scope, and teardown cleanup.
+
+## Already verified in GitHub
+
+`v2/01-create-compromised-sp` now uses:
+
+```powershell
+-RoleDefinitionName 'LOD Contributor' `
+```
+
+instead of:
+
+```powershell
+-RoleDefinitionName 'Contributor' `
+```
+
+No full replacement of the GitHub file is required. Keep the rest of `v2/01-create-compromised-sp` unchanged.
+
+## Replace or update these LCAs
+
+- `168011-register-resource-providers.dropin.ps1`
+  - Adds strict lab value validation for `@lab.CloudSubscription.Id`.
+  - Keeps provider registration quiet and avoids polling with `Get-AzResourceProvider`.
+
+- `168012-create-compromised-sp-wrapper.dropin.ps1`
+  - Validates all lab values before passing them into the GitHub script.
+  - Builds `svc-nscs-storage-sync-<LabInstanceId>` from a resolved LabInstanceId.
+
+- `168014-seed-nscs-evidence-wrapper.dropin.ps1`
+  - Validates all lab values before passing them into the GitHub script.
+  - Builds `svc-nscs-storage-sync-<LabInstanceId>` from a resolved LabInstanceId.
+
+- `168015-validate-nscs-lab-state.dropin.ps1`
+  - Validates lab values instead of using raw tokens.
+  - Confirms the SP has `LOD Contributor` at the lab resource group scope.
+  - Confirms the SP does not still have `Contributor` at the lab resource group scope.
+
+- `168016-generate-management-plane-activity.dropin.ps1`
+  - Validates lab values instead of using raw tokens.
+  - Builds the app display name from resolved LabInstanceId.
+
+- `168955-ingest-security-events.dropin.ps1`
+  - Validates subscription, resource group, lab instance ID, and SQL password before use.
+  - Preserves the SQL ingest behavior.
+
+- `168999-teardown-nscs-service-principal.dropin.ps1`
+  - Removes role assignments for the lab-created SP.
+  - Removes Key Vault access policy entries for the SP.
+  - Removes the service principal.
+  - Removes the app registration.
+
+## LCA name typo to fix
+
+Rename the teardown action from:
+
+```text
+Teardown-cscs-sp
+```
+
+to:
+
+```text
+Teardown-nscs-sp
+```
+
+## Security response
+
+Suggested response back to security:
+
+```text
+Updated. The simulated workload identity now uses LOD Contributor instead of Contributor at the lab resource group scope. The teardown path now removes the lab-created role assignments, Key Vault access policy entry, service principal, and app registration for svc-nscs-storage-sync-<LabInstanceId>. LCA launchers and direct scripts now resolve and validate Skillable lab values before use, including Create SP, Seed Evidence, Validate, Management-plane Activity, Ingest, Register Providers, and Teardown.
+```
