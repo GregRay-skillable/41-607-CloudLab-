@@ -479,7 +479,7 @@ try {
 
     Ensure-RoleAssignment `
         -ObjectId $sp.Id `
-        -RoleDefinitionName 'Contributor' `
+        -RoleDefinitionName 'LOD Contributor' `
         -Scope $resourceGroupId `
         -MaxAttempts 10 `
         -DelaySeconds 20
